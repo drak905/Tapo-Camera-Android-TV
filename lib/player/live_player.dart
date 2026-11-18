@@ -14,15 +14,20 @@ enum LiveState { connecting, playing, retrying, failed }
 /// Message shown when the native player fails: the bridge's last error for
 /// the camera (secrets redacted) when there is one, else the player's own
 /// message, else `Stream interrupted`.
-String mapPlayerError({String? bridgeError, String? playerMessage}) => throw UnimplementedError();
+String mapPlayerError({String? bridgeError, String? playerMessage}) {
+  if (bridgeError != null && bridgeError.trim().isNotEmpty) return bridgeError;
+  if (playerMessage != null && playerMessage.trim().isNotEmpty) return playerMessage;
+  return 'Stream interrupted';
+}
 
 /// Wraps the native view so it never takes D-pad focus: `ExcludeFocus`
 /// (excluding true) around the platform view. Hybrid composition,
 /// transparent hit testing.
-Widget excludeNativeFocus(Widget platformView) => throw UnimplementedError();
+Widget excludeNativeFocus(Widget platformView) => ExcludeFocus(child: platformView);
 
 /// Creation params of the native view: `url`, `snapshot`.
-Map<String, Object?> nativeVideoParams({required String url, String? snapshotPath}) => throw UnimplementedError();
+Map<String, Object?> nativeVideoParams({required String url, String? snapshotPath}) =>
+    {'url': url, 'snapshot': snapshotPath};
 
 /// Routes native player events (see LivePlayer.kt) to their view.
 class _PlayerEvents {
@@ -50,8 +55,8 @@ class _NativeVideo extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     // The native view never takes focus; keep it out of D-pad traversal.
-    return ExcludeFocus(
-      child: PlatformViewLink(
+    return excludeNativeFocus(
+      PlatformViewLink(
         viewType: _viewType,
         surfaceFactory: (context, controller) => AndroidViewSurface(
           controller: controller as AndroidViewController,
@@ -64,7 +69,7 @@ class _NativeVideo extends StatelessWidget {
             id: params.id,
             viewType: _viewType,
             layoutDirection: TextDirection.ltr,
-            creationParams: {'url': url, 'snapshot': snapshotPath},
+            creationParams: nativeVideoParams(url: url, snapshotPath: snapshotPath),
             creationParamsCodec: const StandardMessageCodec(),
           )
             ..addOnPlatformViewCreatedListener(params.onPlatformViewCreated)
@@ -195,8 +200,10 @@ class LiveVideoState extends State<LiveVideo> {
       case 'snapshot':
         Snapshots.instance.updated(widget.camera.deviceId);
       case 'error':
-        final relayError = widget.app.relay.lastErrors[widget.camera.deviceId];
-        _onFailure(relayError ?? '${event['message'] ?? 'Stream interrupted'}');
+        _onFailure(mapPlayerError(
+          bridgeError: widget.app.relay.lastErrors[widget.camera.deviceId],
+          playerMessage: event['message'] as String?,
+        ));
     }
   }
 

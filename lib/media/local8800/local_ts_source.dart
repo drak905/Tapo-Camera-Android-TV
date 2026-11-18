@@ -3,10 +3,13 @@ library;
 
 import 'dart:typed_data';
 
+import '../client_parts.dart';
 import '../media_deps.dart';
 import '../media_source.dart';
 import '../media_transport.dart';
+import '../preview_stream.dart';
 import '../stream_limiter.dart';
+import 'media_session.dart';
 
 class LocalTsSource implements MediaSource {
   LocalTsSource({
@@ -44,9 +47,11 @@ class LocalTsSource implements MediaSource {
   /// Ack every Nth `X-Data-Sequence` (25), only with a session id.
   final int ackEvery;
 
+  PreviewStream? _run;
+
   /// Session id once the camera has sent one (params.session_id,
   /// result.session_id or X-Session-Id).
-  String? get sessionId => throw UnimplementedError();
+  String? get sessionId => _run?.session?.sessionId;
 
   /// Flow: gate, limiter, handshake, preview request (seq 1), wait for the
   /// matching response (error codes -52407/-52405/-52419/-52435 throw
@@ -55,5 +60,14 @@ class LocalTsSource implements MediaSource {
   /// only (JSON and audio are never forwarded). Cancelling sends the stop
   /// request (only with a session id), waits [stopLinger], then closes.
   @override
-  Stream<Uint8List> openTs() => throw UnimplementedError();
+  Stream<Uint8List> openTs() => PreviewStream.open(
+        openSession: () => MediaSession.connect(host: host, port: port, auth: auth, connector: connector),
+        requestBody: (seq) => previewRequestJson(resolution, seq: seq),
+        limiter: limiter,
+        limiterKey: limiterKey ?? host,
+        startGate: startGate,
+        stopLinger: stopLinger,
+        ackEvery: ackEvery,
+        onCreate: (run) => _run = run,
+      );
 }

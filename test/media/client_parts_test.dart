@@ -62,7 +62,7 @@ void main() {
     test('preview request exact json (VGA)', () {
       expect(
         previewRequestJson('VGA'),
-        '{"type":"request","seq":1,"params":{"method":"get","preview":{"channels":[0],"resolutions":["VGA"],"audio":["default"]}}}',
+        '{"type":"request","params":{"method":"get","preview":{"channels":[0],"resolutions":["VGA"],"audio":["default"]}},"seq":1}',
       );
     });
 

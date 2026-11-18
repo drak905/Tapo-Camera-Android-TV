@@ -1,12 +1,19 @@
 /// Live preview through the cloud relay as plain MPEG-TS.
 library;
 
+import 'dart:async';
 import 'dart:typed_data';
 
+import '../client_parts.dart';
+import '../local8800/media_session.dart';
 import '../media_deps.dart';
 import '../media_source.dart';
 import '../media_transport.dart';
+import '../part_decryptor.dart';
+import '../preview_stream.dart';
 import '../stream_limiter.dart';
+import 'relay_slot.dart';
+import 'relay_tunnel.dart';
 
 class RelayTsSource implements MediaSource {
   RelayTsSource({
@@ -20,6 +27,8 @@ class RelayTsSource implements MediaSource {
     this.heartbeatInterval = const Duration(seconds: 15),
     this.stopLinger = const Duration(milliseconds: 150),
     this.ackEvery = 25,
+    this.deviceType = 'SMART.IPCAMERA',
+    this.model,
   });
 
   final String deviceId;
@@ -27,6 +36,8 @@ class RelayTsSource implements MediaSource {
   final TransportConnector connector;
   final String resolution;
   final int cloudType;
+  final String deviceType;
+  final String? model;
 
   /// Keyed by [deviceId]; the lease is released when the stream ends.
   final StreamLimiter? limiter;
@@ -46,5 +57,39 @@ class RelayTsSource implements MediaSource {
   /// Fatal relay errors (-1007 etc.) end the stream without reconnect.
   /// Cancelling sends the stop request, waits [stopLinger], then closes.
   @override
-  Stream<Uint8List> openTs() => throw UnimplementedError();
+  Stream<Uint8List> openTs() {
+    Timer? heartbeat;
+    return PreviewStream.open(
+      openSession: () async {
+        final slot = await RelaySlotClient(auth).requestSlot(
+          deviceId,
+          deviceType: deviceType,
+          model: model,
+          resolution: resolution,
+          cloudType: cloudType,
+        );
+        final tunnel = await RelayTunnel.open(
+          slot,
+          connector: connector,
+          clientModel: auth.clientModel,
+          terminalUuid: auth.terminalUuid,
+          appVersion: auth.appVersion,
+        );
+        return MediaSession.overTunnel(tunnel.transport, tunnel.input, decryptor: const PassthroughDecryptor());
+      },
+      requestBody: (seq) => previewRequestJson(resolution, seq: seq),
+      limiter: limiter,
+      limiterKey: deviceId,
+      startGate: startGate,
+      stopLinger: stopLinger,
+      ackEvery: ackEvery,
+      onSession: (session) {
+        heartbeat = Timer.periodic(heartbeatInterval, (_) => session.sendRaw(session.heartbeatPart()));
+      },
+      onSessionEnd: () {
+        heartbeat?.cancel();
+        heartbeat = null;
+      },
+    );
+  }
 }

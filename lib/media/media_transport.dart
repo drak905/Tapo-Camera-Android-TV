@@ -2,6 +2,8 @@
 /// against in-memory fakes and run over TCP / TLS on a TV.
 library;
 
+import 'dart:async';
+import 'dart:io';
 import 'dart:typed_data';
 
 abstract class MediaTransport {
@@ -27,6 +29,44 @@ typedef TransportConnector = Future<MediaTransport> Function(
   Duration? timeout,
 });
 
+/// Trust store for relay TLS. The app sets this once at start-up to a context
+/// that adds the TP-Link roots (`TapoCloud.buildContext`); null uses the
+/// platform defaults.
+SecurityContext? mediaTlsContext;
+
+class _SocketTransport implements MediaTransport {
+  _SocketTransport(this._socket);
+  final Socket _socket;
+  bool _closed = false;
+
+  @override
+  Stream<Uint8List> get input => _socket;
+
+  @override
+  void add(List<int> data) {
+    if (_closed) return;
+    _socket.add(data);
+  }
+
+  @override
+  Future<void> flush() async {
+    if (_closed) return;
+    try {
+      await _socket.flush();
+    } catch (_) {}
+  }
+
+  @override
+  Future<void> close() async {
+    if (_closed) return;
+    _closed = true;
+    try {
+      await _socket.close().timeout(const Duration(seconds: 1));
+    } catch (_) {}
+    _socket.destroy();
+  }
+}
+
 /// Real TCP/TLS connector (`dart:io` Socket / SecureSocket).
 Future<MediaTransport> connectSocketTransport(
   String host,
@@ -34,5 +74,19 @@ Future<MediaTransport> connectSocketTransport(
   bool tls = false,
   String? serverName,
   Duration? timeout,
-}) =>
-    throw UnimplementedError();
+}) async {
+  final Socket raw = await Socket.connect(host, port, timeout: timeout ?? const Duration(seconds: 10));
+  raw.setOption(SocketOption.tcpNoDelay, true);
+  if (!tls) return _SocketTransport(raw);
+  try {
+    final secure = await SecureSocket.secure(
+      raw,
+      host: serverName ?? host,
+      context: mediaTlsContext,
+    ).timeout(timeout ?? const Duration(seconds: 10));
+    return _SocketTransport(secure);
+  } catch (_) {
+    raw.destroy();
+    rethrow;
+  }
+}

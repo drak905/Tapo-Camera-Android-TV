@@ -77,4 +77,16 @@ class SdCardOfflineException extends MediaException {
 
 /// Replaces every non-empty entry of [secrets] in [text] with `***`, and any
 /// `k=` query value of a bridge URL and RTSP userinfo password.
-String redactSecrets(String text, Iterable<String> secrets) => throw UnimplementedError();
+String redactSecrets(String text, Iterable<String> secrets) {
+  var out = text;
+  final sorted = secrets.where((s) => s.isNotEmpty).toList()..sort((a, b) => b.length.compareTo(a.length));
+  for (final s in sorted) {
+    out = out.replaceAll(s, '***');
+  }
+  out = out.replaceAllMapped(RegExp(r'([?&]k=)[^&\s]*'), (m) => '${m[1]}***');
+  out = out.replaceAllMapped(
+    RegExp(r'(rtsps?://[^\s:/@]*:)[^\s]*@'),
+    (m) => '${m[1]}***@',
+  );
+  return out;
+}
