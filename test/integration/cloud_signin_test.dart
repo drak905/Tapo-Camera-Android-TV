@@ -5,7 +5,7 @@
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tapo_tv/api/tapo_cloud.dart';
 
-import '../fixtures/mock_cloud.dart';
+import '../fixtures/mock_cloud.dart' hide iotServiceId, cipcServiceId;
 import 'support/cloud_rig.dart';
 
 void main() {
