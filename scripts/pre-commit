@@ -1,0 +1,20 @@
+#!/usr/bin/env sh
+# Blocks keystores, .env files, APKs, private keys and leaked credentials.
+# Install: powershell -File scripts/install_hooks.ps1
+STAGED_FILES=$(git diff --cached --name-only --diff-filter=ACM)
+if [ -z "$STAGED_FILES" ]; then exit 0; fi
+
+FORBIDDEN_FILES=$(echo "$STAGED_FILES" | grep -E '\.(jks|keystore|apk|aab|dex|so|pfx|p12|key)$|(^|/)key\.properties$|(^|/)local\.properties$|(^|/)\.env($|\.)' | grep -vE '\.example$')
+if [ -n "$FORBIDDEN_FILES" ]; then
+    echo "[SECURITY BLOCK] Forbidden keystore, binary or credential file staged:"
+    echo "$FORBIDDEN_FILES"
+    exit 1
+fi
+
+LEAK_MATCH=$(git diff --cached -U0 -- . ':(exclude)scripts/pre-commit' | grep -E '^\+' | grep -vE '^\+\+\+|your_local_camera|your_tapo_cloud|camera_user:camera_password|\{user\}:\{pass\}|mock_pass|test_pass|TOPO_DEMO' | grep -iE '(rtsp://[^/:[:space:]]+:[^@[:space:]]+@[0-9]+\.[0-9]+|stok=[a-f0-9]{16,}|storePassword[[:space:]]*=[[:space:]]*"|keyPassword[[:space:]]*=[[:space:]]*"|TAPO_.*_PASS[[:space:]]*=[[:space:]]*[^[:space:]]+|192\.168\.(0|[2-9]|[1-9][0-9]+)\.[0-9]+)')
+if [ -n "$LEAK_MATCH" ]; then
+    echo "[SECURITY BLOCK] Possible credential, keystore password, token or private IP in staged diff:"
+    echo "$LEAK_MATCH"
+    exit 1
+fi
+exit 0
