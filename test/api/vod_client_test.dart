@@ -97,6 +97,13 @@ void main() {
       expect(days, ['20240209']);
       expect(control.requests.single['method'], 'searchDateWithVideo');
     });
+
+    test('isoDay turns yyyyMMdd into YYYY-MM-DD and rejects impossible dates', () {
+      expect(isoDay('20240229'), '2024-02-29');
+      for (final bad in ['20230229', '20241301', '20240100', '2024-02-0']) {
+        expect(() => isoDay(bad), throwsA(isA<TapoProtocolError>()), reason: bad);
+      }
+    });
   });
 
   group('day clips', () {

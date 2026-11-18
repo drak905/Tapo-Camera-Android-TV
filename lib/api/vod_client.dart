@@ -73,6 +73,19 @@ List<String> parseDays(Map<String, dynamic> result) {
   return days.toList()..sort();
 }
 
+/// `yyyyMMdd` -> `YYYY-MM-DD`; throws `TapoProtocolError` for an impossible date.
+String isoDay(String yyyymmdd) {
+  if (!RegExp(r'^\d{8}$').hasMatch(yyyymmdd)) throw TapoProtocolError('search_results date is not yyyyMMdd');
+  final y = int.parse(yyyymmdd.substring(0, 4));
+  final m = int.parse(yyyymmdd.substring(4, 6));
+  final d = int.parse(yyyymmdd.substring(6, 8));
+  final date = DateTime(y, m, d);
+  if (date.year != y || date.month != m || date.day != d) {
+    throw TapoProtocolError('search_results date is not a valid date');
+  }
+  return '${yyyymmdd.substring(0, 4)}-${yyyymmdd.substring(4, 6)}-${yyyymmdd.substring(6, 8)}';
+}
+
 /// `searchVideoWithUTC` page. Uses `id: 1` unless [playerId] is given.
 Map<String, dynamic> buildDayClipsRequest({
   required int startTime,
@@ -170,10 +183,13 @@ class VodClient {
     return items.first;
   }
 
+  /// Days with recordings as ISO `YYYY-MM-DD` (Windows `parse_days` returns
+  /// `datetime.date`; this is its `isoformat`). A `yyyyMMdd` value that is not
+  /// a real date is a `TapoProtocolError` (Windows dtos.py:323).
   Future<List<String>> daysWithRecordings(DateTime start, DateTime end) async {
     final item = await _one(buildSearchDaysRequest(start: start, end: end));
     item.ensureOk();
-    return parseDays(item.result);
+    return [for (final d in parseDays(item.result)) isoDay(d)];
   }
 
   Future<ControlItem> _searchPage(int startTime, int endTime, int first, int last) async {
