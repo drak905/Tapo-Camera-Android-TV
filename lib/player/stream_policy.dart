@@ -9,7 +9,7 @@ class StreamPlan {
   final StreamQuality quality;
 
   /// Preview `resolutions` value: `VGA` or `HD`.
-  String get resolution => throw UnimplementedError();
+  String get resolution => quality == StreamQuality.hd ? 'HD' : 'VGA';
 }
 
 /// Streams for a view, in slot order: camera id to plan.
@@ -24,5 +24,16 @@ Map<String, StreamPlan> planStreams(
   required Set<String> known,
   String? fullscreen,
   int maxVisibleTiles = 4,
-}) =>
-    throw UnimplementedError();
+}) {
+  final plan = <String, StreamPlan>{};
+  if (fullscreen != null && known.contains(fullscreen) && visibleSlots.contains(fullscreen)) {
+    plan[fullscreen] = const StreamPlan(StreamQuality.hd);
+    return plan;
+  }
+  for (final id in visibleSlots) {
+    if (id == null || !known.contains(id) || plan.containsKey(id)) continue;
+    if (plan.length >= maxVisibleTiles) break;
+    plan[id] = const StreamPlan(StreamQuality.vga);
+  }
+  return plan;
+}

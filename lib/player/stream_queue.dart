@@ -27,7 +27,11 @@ class StreamQueue {
   /// for [StreamTicket.ready] before their handshake (Digest login or relay
   /// slot request), not only before ExoPlayer starts.
   StreamTicket request({bool skipQueue = false}) {
-    if (skipQueue) throw UnimplementedError();
+    if (skipQueue) {
+      final ticket = StreamTicket._(this);
+      ticket._ready.complete();
+      return ticket;
+    }
     final ticket = StreamTicket._(this);
     _waiting.add(ticket);
     _pump();
