@@ -104,8 +104,8 @@ TdpKeyPair _generate() {
       fortuna,
     ));
   final pair = generator.generateKeyPair();
-  final pub = pair.publicKey as RSAPublicKey;
-  final priv = pair.privateKey as RSAPrivateKey;
+  final pub = pair.publicKey;
+  final priv = pair.privateKey;
   return TdpKeyPair(pub, priv, _spkiPem(pub));
 }
 
