@@ -149,6 +149,10 @@ void main() {
 
   test('expired cloud token: one silent re-login, then the stream starts', () async {
     final w = await _world();
+    // The CIPC URL is discovered (and cached) at sign-in time in the app; with
+    // a cold cache TapoCloud's own getAppServiceUrl would renew the token first
+    // and the relay -1102 path under test would never run.
+    await w.auth.cipcUrl;
     w.rig.mock.expireTokens();
 
     final bytes = await collect(w.source().openTs(), minBytes: 188 * 32 * 4);
