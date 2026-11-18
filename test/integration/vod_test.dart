@@ -256,11 +256,13 @@ void main() {
       required CameraRole role,
       required bool online,
       required CameraRoute route,
+      String? lanIp,
     }) =>
-        TapoCamera(id: 'dev', name: 'Cam', model: 'C210', role: role, online: online, route: route);
+        TapoCamera(id: 'dev', name: 'Cam', model: 'C210', role: role, online: online, route: route, lanIp: lanIp);
 
     test('VodClient side: LAN owner local, shared / remote through the relay, failures carry a reason', () {
-      final lanOwner = camera(role: CameraRole.owner, online: true, route: CameraRoute.local);
+      // routeFor() only gives a cloud camera CameraRoute.local when it was found on the LAN with a host.
+      final lanOwner = camera(role: CameraRole.owner, online: true, route: CameraRoute.local, lanIp: '192.168.1.20');
       expect(vc.chooseVodTransport(lanOwner, relayAvailable: true).kind, vc.VodTransportKind.local);
 
       final remoteOwner = camera(role: CameraRole.owner, online: true, route: CameraRoute.cloud);
