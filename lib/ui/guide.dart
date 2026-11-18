@@ -39,7 +39,7 @@ final Map<GuideSection, (String, IconData, List<_Row>)> _sections = {
     [
       _Row([const KeyCap('OK', large: true)], 'Watch live', 'Opens the outlined camera full screen.', {_RemoteKey.ok}),
       _Row([const KeyCap('Hold OK', large: true)], 'Quick actions',
-          'Hold OK on a camera for privacy mode and reconnect.', {_RemoteKey.ok}),
+          'Hold OK on a camera for privacy mode, night vision, siren, rename and reconnect.', {_RemoteKey.ok}),
       _Row([const KeyCap('1 – 9', large: true)], 'Jump to camera', 'Number keys open camera 1 to 9.', {_RemoteKey.digits}),
       _Row([const KeyCap('', icon: Icons.arrow_upward_rounded, large: true)], 'Top menu',
           'Move up to switch between Cameras, Multi-view and Settings, then press OK.', {_RemoteKey.up}),
@@ -60,7 +60,21 @@ final Map<GuideSection, (String, IconData, List<_Row>)> _sections = {
           'Hold OK on a tile to put another camera in it.', {_RemoteKey.ok}),
     ],
   ),
-  GuideSection.recordings: ('Recordings', Icons.history_rounded, []), // RED stub: rows come with GREEN
+  GuideSection.recordings: (
+    'Recordings',
+    Icons.history_rounded,
+    [
+      _Row([const KeyCap('', icon: Icons.swap_horiz_rounded, large: true)], 'Scrub',
+          'Left and Right move along the 24 hour timeline. Hold to move faster.',
+          {_RemoteKey.left, _RemoteKey.right}),
+      _Row([const KeyCap('', icon: Icons.swap_vert_rounded, large: true)], 'Change day',
+          'Up shows a later day, Down an earlier day.', {_RemoteKey.up, _RemoteKey.down}),
+      _Row([const KeyCap('OK', large: true)], 'Play',
+          'OK plays from the marker. While playing, OK shows pause, speed and the timeline.', {_RemoteKey.ok}),
+      _Row([const KeyCap('', icon: Icons.arrow_back_rounded, large: true)], 'Back',
+          'Leaves the playback and returns to the timeline, then to the live view.', {_RemoteKey.back}),
+    ],
+  ),
   GuideSection.live: (
     'Live view',
     Icons.live_tv_rounded,
@@ -68,7 +82,8 @@ final Map<GuideSection, (String, IconData, List<_Row>)> _sections = {
       _Row([const KeyCap('', icon: Icons.open_with_rounded, large: true)], 'Pan & tilt',
           'With the controls hidden, arrows move the camera. Hold to keep moving.', _dpad),
       _Row([const KeyCap('OK', large: true)], 'Show controls',
-          'Privacy, step size, reconnect and previous/next camera.', {_RemoteKey.ok}),
+          'Privacy, night vision, siren, rename, Recordings, step size, reconnect and previous/next camera.',
+          {_RemoteKey.ok}),
       _Row([const KeyCap('CH +', large: true), const SizedBox(width: 6), const KeyCap('CH −', large: true)],
           'Switch camera', 'Channel keys, previous/next track keys or 1–9. Without pan & tilt, left/right also switch.',
           {_RemoteKey.chUp, _RemoteKey.chDown}),
@@ -230,10 +245,10 @@ class _Remote extends StatelessWidget {
 
   Widget _round(_RemoteKey k, IconData icon) => AnimatedContainer(
         duration: TopoMotion.focus,
-        width: 36,
-        height: 36,
+        width: 32,
+        height: 32,
         decoration: BoxDecoration(color: _bg(k), shape: BoxShape.circle),
-        child: Icon(icon, size: 20, color: _fg(k)),
+        child: Icon(icon, size: 19, color: _fg(k)),
       );
 
   Widget _arrow(_RemoteKey k, IconData icon) => AnimatedContainer(
