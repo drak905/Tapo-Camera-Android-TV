@@ -7,6 +7,9 @@ import 'dart:math';
 import 'camera_dtos.dart';
 import 'camera_router.dart';
 import 'tapo_errors.dart';
+import 'vod_transport.dart';
+
+export 'vod_transport.dart';
 
 /// One recorded clip; times are UTC epoch seconds.
 class RecordingClip {
@@ -228,18 +231,6 @@ class VodClient {
     clips.sort((a, b) => a.start.compareTo(b.start));
     return clips;
   }
-}
-
-enum VodTransportKind { local, relay }
-
-/// Why playback is impossible.
-enum VodFailReason { notOnThisNetwork, cameraOffline, sharedCameraCloudOnly }
-
-class VodTransportChoice {
-  const VodTransportChoice.use(this.kind) : failure = null;
-  const VodTransportChoice.failed(this.failure) : kind = null;
-  final VodTransportKind? kind;
-  final VodFailReason? failure;
 }
 
 /// Relay when the camera is cloud-routed and a signed-in relay provider

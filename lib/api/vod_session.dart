@@ -20,6 +20,9 @@ import '../media/preview_stream.dart' show kStreamLimitCodes;
 import '../media/relay/relay_slot.dart';
 import '../media/relay/relay_tunnel.dart';
 import '../media/stream_limiter.dart';
+import 'vod_transport.dart';
+
+export 'vod_transport.dart';
 
 /// A recorded clip in UTC epoch seconds.
 class VodClipRange {
@@ -46,22 +49,6 @@ Duration paceInterval(Duration base, String speed) {
   return Duration(microseconds: base.inMicroseconds ~/ factor);
 }
 
-/// Which path an SD playback takes.
-enum VodTransportKind { local, relay, none }
-
-class VodTransportChoice {
-  const VodTransportChoice(this.kind, {this.failReason});
-  final VodTransportKind kind;
-
-  /// Set when [kind] is [VodTransportKind.none]: `not on this network`,
-  /// `camera offline` or `shared camera cloud only`.
-  final String? failReason;
-}
-
-const String kReasonNotOnNetwork = 'not on this network';
-const String kReasonCameraOffline = 'camera offline';
-const String kReasonSharedCloudOnly = 'shared camera cloud only';
-
 /// Relay when the camera is cloud-routed (remote, shared role 1, offline on
 /// LAN) and a signed-in relay provider exists; otherwise local :8800. Shared
 /// cameras on the LAN still use the relay. When neither works the choice is
@@ -73,14 +60,14 @@ VodTransportChoice selectVodTransport({
   required bool hasRelayProvider,
 }) {
   if (role == 1) {
-    if (!hasRelayProvider) return const VodTransportChoice(VodTransportKind.none, failReason: kReasonSharedCloudOnly);
-    if (!online) return const VodTransportChoice(VodTransportKind.none, failReason: kReasonCameraOffline);
-    return const VodTransportChoice(VodTransportKind.relay);
+    if (!hasRelayProvider) return const VodTransportChoice.failed(VodFailReason.sharedCameraCloudOnly);
+    if (!online) return const VodTransportChoice.failed(VodFailReason.cameraOffline);
+    return const VodTransportChoice.use(VodTransportKind.relay);
   }
-  if (onLan) return const VodTransportChoice(VodTransportKind.local);
-  if (!online) return const VodTransportChoice(VodTransportKind.none, failReason: kReasonCameraOffline);
-  if (hasRelayProvider) return const VodTransportChoice(VodTransportKind.relay);
-  return const VodTransportChoice(VodTransportKind.none, failReason: kReasonNotOnNetwork);
+  if (onLan) return const VodTransportChoice.use(VodTransportKind.local);
+  if (!online) return const VodTransportChoice.failed(VodFailReason.cameraOffline);
+  if (hasRelayProvider) return const VodTransportChoice.use(VodTransportKind.relay);
+  return const VodTransportChoice.failed(VodFailReason.notOnThisNetwork);
 }
 
 enum _End { seek, stop, finished, closed, fatal }
