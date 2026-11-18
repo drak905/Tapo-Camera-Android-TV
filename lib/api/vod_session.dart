@@ -5,6 +5,7 @@
 library;
 
 import 'dart:async';
+import 'dart:collection';
 import 'dart:convert';
 import 'dart:typed_data';
 
@@ -20,6 +21,7 @@ import '../media/preview_stream.dart' show kStreamLimitCodes;
 import '../media/relay/relay_slot.dart';
 import '../media/relay/relay_tunnel.dart';
 import '../media/stream_limiter.dart';
+import 'vod_timeline.dart';
 import 'vod_transport.dart';
 
 export 'vod_transport.dart';
@@ -93,7 +95,9 @@ class VodSession implements MediaSource {
     this.limiter,
     this.clips = const [],
     this.stopLinger = const Duration(milliseconds: 150),
+    Duration Function()? monotonic,
   })  : deviceId = null,
+        _clock = monotonic ?? _stopwatchClock(),
         relayAuth = null,
         heartbeatInterval = const Duration(seconds: 15) {
     _resumeAt = startUtc;
@@ -111,7 +115,9 @@ class VodSession implements MediaSource {
     this.clips = const [],
     this.heartbeatInterval = const Duration(seconds: 15),
     this.stopLinger = const Duration(milliseconds: 150),
+    Duration Function()? monotonic,
   })  : host = null,
+        _clock = monotonic ?? _stopwatchClock(),
         port = 443,
         localAuth = null,
         relayAuth = auth {
@@ -134,6 +140,16 @@ class VodSession implements MediaSource {
   final Duration heartbeatInterval;
   final Duration stopLinger;
 
+  /// Monotonic time for pacing; tests pass fake_async's elapsed.
+  final Duration Function() _clock;
+  static Duration Function() _stopwatchClock() {
+    final sw = Stopwatch()..start();
+    return () => sw.elapsed;
+  }
+
+  late final List<(double, double)> _segments =
+      normalizeSegments(clips.map((c) => (c.start.toDouble(), c.end.toDouble())));
+
   static const int _ackEvery = 25;
   static const int _maxEarlyParts = 8;
   static const int _maxFailedAttempts = 5;
@@ -147,6 +163,10 @@ class VodSession implements MediaSource {
   int? _lastPosition;
   late int _resumeAt;
   String _speed = '1/1';
+  int _speedGen = 0;
+  bool _paused = false;
+  final StreamController<int> _positions = StreamController<int>.broadcast();
+  Duration _lastPositionEmit = Duration(days: -1);
 
   StreamController<Uint8List>? _out;
   bool _loopRunning = false;
@@ -170,6 +190,21 @@ class VodSession implements MediaSource {
   int? get lastPositionUtc => _lastPosition;
   void reportPosition(int utcSeconds) => _lastPosition = utcSeconds;
 
+  /// Position in UTC seconds, emitted when it changes, at most about 5 times
+  /// a second (and at once after a jump or seek).
+  Stream<int> get positions => _positions.stream;
+
+  void _notePosition(double position, {bool force = false}) {
+    final sec = position.floor();
+    final changed = sec != _lastPosition;
+    _lastPosition = sec;
+    if (_positions.isClosed || !(changed || force)) return;
+    final now = _clock();
+    if (!force && now - _lastPositionEmit < const Duration(milliseconds: 200)) return;
+    _lastPositionEmit = now;
+    _positions.add(sec);
+  }
+
   String get speed => _speed;
 
   /// Applies [speed] client-side (pacing). Throws [ArgumentError] for a speed
@@ -179,7 +214,11 @@ class VodSession implements MediaSource {
       throw ArgumentError.value(speed, 'speed', 'must be one of $kVodSpeeds');
     }
     _speed = speed;
+    _speedGen++;
+    _attempt?.wake();
   }
+
+  double get _speedFactor => int.parse(_speed.split('/').first).toDouble();
 
   void _setState(VodState s) {
     if (_state == s) return;
@@ -369,12 +408,16 @@ class VodSession implements MediaSource {
 
   /// `do pause` (`{"type":"request","params":{"method":"do","pause":"null"},"seq":N}`).
   Future<void> pause() async {
+    _paused = true;
+    _attempt?.wake();
     await _control('pause');
     if (_state == VodState.playing) _setState(VodState.paused);
   }
 
   /// `do play`.
   Future<void> resume() async {
+    _paused = false;
+    _attempt?.wake();
     await _control('play');
     if (_state == VodState.paused) _setState(VodState.playing);
   }
@@ -392,6 +435,8 @@ class VodSession implements MediaSource {
   Future<void> seek(int utcSeconds) async {
     _resumeAt = utcSeconds;
     _lastPosition = utcSeconds;
+    _paused = false;
+    if (!_positions.isClosed) _positions.add(utcSeconds);
     final attempt = _attempt;
     if (attempt != null && !_stopping) {
       attempt.interrupt(_End.seek);
@@ -426,8 +471,16 @@ class VodSession implements MediaSource {
   }
 }
 
+/// A media part waiting for its turn: [ackSeq] is acknowledged once forwarded.
+class _Queued {
+  const _Queued(this.body, this.ackSeq, this.headerPts);
+  final Uint8List body;
+  final int? ackSeq;
+  final int? headerPts;
+}
+
 class _Attempt {
-  _Attempt(this.owner, this.gen);
+  _Attempt(this.owner, this.gen) : timeline = PtsTimeline(owner._segments, owner._resumeAt.toDouble());
 
   final VodSession owner;
   final int gen;
@@ -443,11 +496,138 @@ class _Attempt {
   int _seq = 0;
   _End? _interrupt;
 
+  // Pacing: parts are queued in arrival order and released by one drain loop.
+  static const int _maxQueued = 64;
+  static const int _resumeBelow = 32;
+  final PtsTimeline timeline;
+  final VideoSplitter _splitter = VideoSplitter();
+  final Pacer _pacer = Pacer();
+  final Queue<_Queued> _queue = Queue<_Queued>();
+  bool _draining = false;
+  bool _abort = false;
+  bool _subPaused = false;
+  int _paceGen = -1;
+  Completer<void>? _idle;
+  Completer<void>? _wakeC;
+
   Future<void> get finished => _cleaned.future;
 
   void interrupt(_End why) {
     _interrupt ??= why;
+    _abort = true;
+    wake();
     _complete(_Outcome(why));
+  }
+
+  /// Re-evaluates pause and speed in the drain loop.
+  void wake() {
+    final c = _wakeC;
+    if (c != null && !c.isCompleted) c.complete();
+  }
+
+  Future<void> _sleep(Duration? d) {
+    final c = Completer<void>();
+    _wakeC = c;
+    final timer = d == null
+        ? null
+        : Timer(d, () {
+            if (!c.isCompleted) c.complete();
+          });
+    return c.future.whenComplete(() {
+      timer?.cancel();
+      if (identical(_wakeC, c)) _wakeC = null;
+    });
+  }
+
+  void _enqueue(Uint8List body, int? ackSeq, int? headerPts) {
+    _mediaSeen = true;
+    _queue.add(_Queued(body, ackSeq, headerPts));
+    if (_queue.length >= _maxQueued && !_subPaused) {
+      _subPaused = true;
+      _sub?.pause();
+    }
+    if (!_draining) {
+      _draining = true;
+      unawaited(_drain());
+    }
+  }
+
+  Future<void> _drain() async {
+    try {
+      while (_queue.isNotEmpty && !_abort) {
+        final item = _queue.removeFirst();
+        await _release(item);
+        if (_subPaused && _queue.length < _resumeBelow) {
+          _subPaused = false;
+          _sub?.resume();
+        }
+      }
+    } catch (_) {
+      // The consumer went away; nothing left to forward.
+    } finally {
+      _draining = false;
+      final idle = _idle;
+      _idle = null;
+      if (idle != null && !idle.isCompleted) idle.complete();
+    }
+  }
+
+  /// Completes when the drain loop has nothing left (or was aborted).
+  Future<void> _whenDrained() async {
+    while (_draining) {
+      final idle = _idle ??= Completer<void>();
+      await idle.future;
+    }
+  }
+
+  Future<void> _release(_Queued item) async {
+    final pieces = _splitter.split(item.body) ?? [TsPiece(item.headerPts, item.body)];
+    for (final piece in pieces) {
+      if (!await _pace(piece.pts)) return;
+      final out = owner._out;
+      if (out == null || out.isClosed) return;
+      out.add(piece.data);
+    }
+    final seq = item.ackSeq;
+    final s = session;
+    if (seq != null && seq != 0 && seq % VodSession._ackEvery == 0 && s != null && s.sessionId != null) {
+      s.sendRaw(s.ackPart(seq));
+    }
+  }
+
+  /// Waits until the frame starting at [pts] is due (and the stream is not
+  /// paused). False when the attempt was aborted.
+  Future<bool> _pace(int? pts) async {
+    var position = timeline.position;
+    var jumped = false;
+    if (pts != null) {
+      jumped = timeline.advance(pts);
+      position = timeline.position;
+      if (jumped || owner._speedGen != _paceGen) {
+        _pacer.rebase(position, owner._speedFactor, owner._clock());
+        _paceGen = owner._speedGen;
+      }
+    }
+    var wasPaused = false;
+    while (true) {
+      if (_abort) return false;
+      if (owner._paused) {
+        wasPaused = true;
+        await _sleep(null);
+        continue;
+      }
+      if (pts == null) return true;
+      if (wasPaused || owner._speedGen != _paceGen) {
+        _pacer.rebase(position, owner._speedFactor, owner._clock());
+        _paceGen = owner._speedGen;
+        wasPaused = false;
+      }
+      final left = _pacer.wait(position, owner._clock());
+      if (left == Duration.zero) break;
+      await _sleep(left);
+    }
+    owner._notePosition(position, force: jumped);
+    return true;
   }
 
   void _complete(_Outcome o) {
@@ -461,6 +641,16 @@ class _Attempt {
     } catch (e) {
       outcome = _Outcome(owner._isFatal(e) ? _End.fatal : _End.closed, error: e);
     }
+    if (_interrupt == null && (outcome.end == _End.finished || outcome.end == _End.closed)) {
+      // The camera sends faster than real time: play out what is queued first.
+      await _whenDrained();
+      final why = _interrupt;
+      if (why != null) outcome = _Outcome(why);
+    }
+    _abort = true;
+    wake();
+    await _whenDrained();
+    _queue.clear();
     await _cleanup();
     if (!_cleaned.isCompleted) _cleaned.complete();
     return outcome;
@@ -497,19 +687,9 @@ class _Attempt {
       if (_early.length < VodSession._maxEarlyParts) _early.add(part.body);
       return;
     }
-    _forward(part.body, part);
-  }
-
-  void _forward(Uint8List body, MultipartPart part) {
     final out = owner._out;
     if (out == null || out.isClosed) return;
-    _mediaSeen = true;
-    out.add(body);
-    final seq = int.tryParse(part.header('X-Data-Sequence') ?? '');
-    final s = session;
-    if (seq != null && seq != 0 && seq % VodSession._ackEvery == 0 && s != null && s.sessionId != null) {
-      s.sendRaw(s.ackPart(seq));
-    }
+    _enqueue(part.body, int.tryParse(part.header('X-Data-Sequence') ?? ''), int.tryParse(part.header('X-Data-PTS') ?? ''));
   }
 
   void _onJson(MultipartPart part) {
@@ -539,12 +719,11 @@ class _Attempt {
         return;
       }
       _accepted = true;
-      if (owner._state != VodState.paused) owner._setState(VodState.playing);
+      owner._setState(owner._paused ? VodState.paused : VodState.playing);
       for (final b in _early) {
         final out = owner._out;
         if (out == null || out.isClosed) break;
-        _mediaSeen = true;
-        out.add(b);
+        _enqueue(b, null, null);
       }
       _early.clear();
       return;

@@ -820,6 +820,7 @@ class LivePlayback implements PlaybackControl {
   LivePlayback(this.session, this.bridgeId, DateTime start, {this.onClose})
       : _state = ValueNotifier(PlaybackState(position: start)) {
     _sub = session.states.listen(_onSession);
+    _posSub = session.positions.listen(_onPosition);
     _timer = Timer.periodic(const Duration(seconds: 1), (_) => _tick());
   }
 
@@ -830,6 +831,7 @@ class LivePlayback implements PlaybackControl {
   final void Function()? onClose;
   final ValueNotifier<PlaybackState> _state;
   late final StreamSubscription<vs.VodState> _sub;
+  late final StreamSubscription<int> _posSub;
   late final Timer _timer;
   bool _stopped = false;
 
@@ -841,6 +843,11 @@ class LivePlayback implements PlaybackControl {
       paused: s == vs.VodState.paused,
       ended: s == vs.VodState.stopped && session.endReason != null,
     );
+  }
+
+  void _onPosition(int utc) {
+    if (_stopped) return;
+    _state.value = _state.value.copyWith(position: DateTime.fromMillisecondsSinceEpoch(utc * 1000, isUtc: true));
   }
 
   void _tick() {
@@ -875,6 +882,7 @@ class LivePlayback implements PlaybackControl {
     _stopped = true;
     _timer.cancel();
     await _sub.cancel();
+    await _posSub.cancel();
     onClose?.call();
     await session.stop();
   }
