@@ -17,6 +17,8 @@ int validMaxRemoteStreams(Object? value) {
 /// (holders may then exceed capacity) and is never evicted. Capacity only
 /// limits the other cameras.
 class RemoteStreamGate {
+  // A private field cannot be a named initializing formal.
+  // ignore: prefer_initializing_formals
   RemoteStreamGate({int capacity = kDefaultMaxRemoteStreams}) : _capacity = capacity;
 
   int _capacity;
