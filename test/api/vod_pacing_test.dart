@@ -75,9 +75,9 @@ void main() {
         }
         pump(async);
         expect(r.c.items, hasLength(1));
-        r.elapse(gap - 5);
+        r.elapse(gap - 40); // pump() already advanced 20 ms
         expect(r.c.items, hasLength(1));
-        r.elapse(10);
+        r.elapse(60);
         expect(r.c.items, hasLength(2));
         r.elapse(gap * 2);
         expect(r.c.items, hasLength(4));
