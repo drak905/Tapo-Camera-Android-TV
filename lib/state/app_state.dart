@@ -8,6 +8,7 @@ import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/cloud_transport.dart';
 import '../api/relay_bridge.dart';
+import '../media/http_ts_source.dart';
 import '../api/tapo_cloud.dart';
 import '../media/remote_stream_gate.dart' show kDefaultMaxRemoteStreams, kMaxRemoteStreamsLimit;
 import '../player/stream_queue.dart';
@@ -106,7 +107,12 @@ class AppState extends ChangeNotifier {
   String _baseUrl = loginUrl;
   late final RelayBridge relay = useBackend && !demo
       ? RelayBridge.sources((id, resolution) => _backend?.sourceFor(id, resolution))
-      : RelayBridge(_resolveForRelay);
+      : demo && _demoStream.isNotEmpty
+          // The native player only accepts bridge URLs, so the demo stream is
+          // proxied through the bridge like a camera.
+          ? RelayBridge.sources(
+              (id, _) => HttpTsSource(Uri.parse('$_demoStream?cam=${Uri.encodeComponent(id)}')))
+          : RelayBridge(_resolveForRelay);
 
   AuthStage stage = AuthStage.starting;
   PendingMfa? pendingMfa;
@@ -253,8 +259,7 @@ class AppState extends ChangeNotifier {
   /// `adb reverse tcp:8099 tcp:8099`.
   static const _demoStream = String.fromEnvironment('TOPO_DEMO_STREAM');
 
-  String streamUrl(Camera camera) =>
-      demo && _demoStream.isNotEmpty ? '$_demoStream?cam=${Uri.encodeComponent(camera.deviceId)}' : relay.urlFor(camera.deviceId);
+  String streamUrl(Camera camera) => relay.urlFor(camera.deviceId);
 
   // ---------------------------------------------------------------- Auth --
 

@@ -22,7 +22,7 @@ param(
 $ErrorActionPreference = 'Stop'
 
 function Find-Adb {
-    $c = Get-Command adb -ErrorAction SilentlyContinue
+    $c = Get-Command adb -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($c) { return $c.Source }
     foreach ($root in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, (Join-Path $env:LOCALAPPDATA 'Android\Sdk'))) {
         if ($root) {
@@ -53,13 +53,23 @@ if (-not $Serial) {
     $Serial = $serials[0]
 }
 
+$failed = @()
 foreach ($p in $Ports) {
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
     if ($Remove) {
         & $adb -s $Serial reverse --remove "tcp:$p" 2>&1 | Out-Null
         Write-Host "removed reverse tcp:$p"
     } else {
-        & $adb -s $Serial reverse "tcp:$p" "tcp:$p" | Out-Null
-        Write-Host "reverse tcp:$p -> host 127.0.0.1:$p ($Serial)"
+        $out = & $adb -s $Serial reverse "tcp:$p" "tcp:$p" 2>&1 | ForEach-Object { "$_" }
+        if ($LASTEXITCODE -ne 0) {
+            $failed += $p
+            Write-Host "reverse tcp:$p failed: $($out -join ' ')" -ForegroundColor Yellow
+        } else {
+            Write-Host "reverse tcp:$p -> host 127.0.0.1:$p ($Serial)"
+        }
     }
+    $ErrorActionPreference = $old
 }
+# Only the demo stream port is required; 8443/8554 are optional dev services.
+if ($failed -contains 8099) { exit 3 }
 exit 0

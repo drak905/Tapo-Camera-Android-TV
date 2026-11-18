@@ -32,6 +32,7 @@ param(
     [int]$PssLimitMb = 220,
     [int]$SampleEvery = 10,
     [int]$CycleDelayMs = 700,
+    [int]$KeyDelayMs = 600,
     [switch]$SkipInstall,
     [switch]$NoStream,
     [string]$Report = ''
@@ -76,7 +77,7 @@ function Finish([int]$code, [string]$status, [string]$why = '') {
 }
 
 function Find-Adb {
-    $c = Get-Command adb -ErrorAction SilentlyContinue
+    $c = Get-Command adb -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($c) { return $c.Source }
     foreach ($r in @($env:ANDROID_HOME, $env:ANDROID_SDK_ROOT, (Join-Path $env:LOCALAPPDATA 'Android\Sdk'))) {
         if ($r) {
@@ -107,7 +108,11 @@ if (-not $Serial) {
     $Serial = $serials[0]
 }
 $result.serial = $Serial
-function Adb { & $adb -s $Serial @args }
+function Adb {
+    # Native stderr (monkey, reverse) must not become a terminating error under 'Stop' (PS 5).
+    $old = $ErrorActionPreference; $ErrorActionPreference = 'Continue'
+    try { & $adb -s $Serial @args 2>&1 | ForEach-Object { "$_" } } finally { $ErrorActionPreference = $old }
+}
 
 # ---- install ------------------------------------------------------------------------
 if (-not $SkipInstall) {
@@ -140,12 +145,18 @@ if ($LASTEXITCODE -ne 0) { Finish 3 'error' 'adb reverse failed' }
 # ---- launch ---------------------------------------------------------------------------
 Adb logcat -c | Out-Null
 Adb shell am force-stop $Package | Out-Null
-$launch = Adb shell monkey -p $Package -c android.intent.category.LEANBACK_LAUNCHER 1 2>&1
-if (($launch -join ' ') -match 'No activities found') {
-    $launch = Adb shell monkey -p $Package -c android.intent.category.LAUNCHER 1 2>&1
+$activity = "$Package/.MainActivity"
+function Start-App { Adb shell am start -W -n $activity | Out-Null }
+function Test-Foreground {
+    $w = (Adb shell dumpsys window) -join "`n"
+    return [bool]($w -match "mCurrentFocus=[^\n]*$([regex]::Escape($Package))")
 }
-if (($launch -join ' ') -match 'No activities found|Error') { Finish 3 'error' "cannot launch $Package" }
-Start-Sleep -Seconds 5
+Start-App
+Start-Sleep -Seconds 8
+if (-not (Test-Foreground)) { Finish 3 'error' "cannot bring $Package to the foreground" }
+$result.relaunches = 0
+$result.foreground_checks = 0
+$result.foreground_ok = 0
 
 function Get-PssMb {
     $txt = (Adb shell dumpsys meminfo $Package) -join "`n"
@@ -156,13 +167,14 @@ function Get-PssMb {
 function Test-Alive { (Adb shell pidof $Package) -match '\d+' }
 
 # DPAD_RIGHT=22 DPAD_DOWN=20 DPAD_CENTER=23 DPAD_LEFT=21 DPAD_UP=19 CHANNEL_UP=166 BACK=4
+# One Back per cycle: OK opens a camera or grid, CH+ switches it, Back returns home.
 $keys = @('KEYCODE_DPAD_RIGHT', 'KEYCODE_DPAD_DOWN', 'KEYCODE_DPAD_CENTER', 'KEYCODE_CHANNEL_UP',
-    'KEYCODE_DPAD_LEFT', 'KEYCODE_DPAD_UP', 'KEYCODE_DPAD_CENTER', 'KEYCODE_BACK')
+    'KEYCODE_BACK', 'KEYCODE_DPAD_LEFT', 'KEYCODE_DPAD_UP')
 
 for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
     foreach ($k in $keys) {
         Adb shell input keyevent $k | Out-Null
-        Start-Sleep -Milliseconds 120
+        Start-Sleep -Milliseconds $KeyDelayMs
     }
     Start-Sleep -Milliseconds $CycleDelayMs
     $result.cycles_done = $cycle
@@ -170,6 +182,9 @@ for ($cycle = 1; $cycle -le $Cycles; $cycle++) {
         $result.process_died = $true
         Finish 1 'failed' "app process died during cycle $cycle"
     }
+    # The cycle must exercise the app, not the launcher: check focus, relaunch if Back left it.
+    $result.foreground_checks++
+    if (Test-Foreground) { $result.foreground_ok++ } else { $result.relaunches++; Start-App; Start-Sleep -Seconds 2 }
     if ($cycle % $SampleEvery -eq 0 -or $cycle -eq $Cycles) {
         $pss = Get-PssMb
         $result.pss_samples_mb += $pss
@@ -188,6 +203,9 @@ if ($result.anr -gt 0) { $result.failures += "$($result.anr) ANR(s) in logcat" }
 if ($result.fatal -gt 0) { $result.failures += "$($result.fatal) FATAL EXCEPTION(s) in logcat" }
 if ($result.process_died) { $result.failures += 'app process died (logcat)' }
 if ($result.pss_max_mb -le 0) { $result.failures += 'could not read PSS from dumpsys meminfo' }
+if ($result.foreground_checks -gt 0 -and $result.foreground_ok -lt [math]::Ceiling($result.foreground_checks * 0.9)) {
+    $result.failures += "app was in the foreground for only $($result.foreground_ok)/$($result.foreground_checks) cycles"
+}
 
 if ($result.failures.Count -gt 0) {
     $result.failures | ForEach-Object { Write-Host "FAIL: $_" -ForegroundColor Red }
