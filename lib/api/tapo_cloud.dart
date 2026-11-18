@@ -13,6 +13,8 @@ import 'dart:typed_data';
 
 import 'package:crypto/crypto.dart';
 
+import 'cloud_transport.dart';
+
 const appName = 'TP-Link_Tapo_Android';
 const appVersion = '3.21.114';
 const productName = 'Topo TV';
@@ -138,6 +140,52 @@ class TapoCloud {
   String _iotAppServer = '';
   String _servicesSyncVersion = 'v2';
 
+  // ---- Wave 2 contract stubs (RED phase, see test/unit/tapo_cloud_test.dart) --
+
+  /// Test/DI constructor: every request goes through [transport] instead of
+  /// `HttpClient`. [locale] is `xx_YY` (default `en_US`). Spec: hc.cloud.*.
+  factory TapoCloud.withTransport({
+    required String terminalUuid,
+    required CloudTransport transport,
+    String locale = 'en_US',
+  }) =>
+      throw UnimplementedError();
+
+  /// Keeps the account secrets in memory so an expired token can be renewed
+  /// silently (captchaLogin once on -20651, one full login on -20652/-20675).
+  /// Never persisted here; never logged. Spec: hc.cloud.token_refresh.
+  void rememberCredentials({
+    required String username,
+    required String password,
+    required String baseUrl,
+  }) =>
+      throw UnimplementedError();
+
+  /// Signed `getAppServiceUrl` call for [serviceIds]. Values that are not
+  /// non-empty strings are dropped and a trailing `/` is stripped. The result
+  /// is cached per session and cleared on re-login. Spec: hc.cloud.service_urls.
+  Future<Map<String, String>> serviceUrls(String baseUrl, List<String> serviceIds) =>
+      throw UnimplementedError();
+
+  /// URL of `nbu.iot-app-server.app-v2`. Throws [TapoException] when the
+  /// scheme is not http(s) or the URL is plain http while the account API is
+  /// https. Spec: hc.cloud.service_urls.
+  Future<String> discoverIotServer(String baseUrl) => throw UnimplementedError();
+
+  /// URL of `cipc.api.cloud`, used by the player lane's relay request together
+  /// with [token] and [postCipc].
+  Future<String> discoverCipcUrl(String baseUrl) => throw UnimplementedError();
+
+  /// IoT headers (Authorization `ut|<token>`, app-cid, x-*; no HMAC headers).
+  /// Spec: hc.cloud.iot_headers.
+  Map<String, String> iotHeaders({bool post = false}) => throw UnimplementedError();
+
+  /// Plain alias or Base64 alias (only when len%4==0, len>=4, strict base64 of
+  /// printable UTF-8 that re-encodes identically). Spec: hc.cloud.alias_decode.
+  static String decodeAlias(String alias) => throw UnimplementedError();
+
+  /// Display alias of a device-list entry: decoded alias, else deviceName, else model.
+  static String aliasOf(Map<String, dynamic> device) => throw UnimplementedError();
   void close() => _http.close(force: true);
 
   // ---------------------------------------------------------------- HTTP --
