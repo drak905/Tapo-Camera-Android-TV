@@ -76,22 +76,27 @@ class _SocketTransport implements MediaTransport {
   }
 }
 
-/// Real TCP/TLS connector (`dart:io` Socket / SecureSocket).
+/// Real TCP/TLS connector (`dart:io` Socket / SecureSocket). TLS verification
+/// (chain and hostname = [serverName] or [host]) is always on; [context] is
+/// the trust store (null: [mediaTlsContext], then the platform roots).
 Future<MediaTransport> connectSocketTransport(
   String host,
   int port, {
   bool tls = false,
   String? serverName,
   Duration? timeout,
+  SecurityContext? context,
+  Duration? connectTimeout,
 }) async {
-  final Socket raw = await Socket.connect(host, port, timeout: timeout ?? const Duration(seconds: 10));
+  final Socket raw =
+      await Socket.connect(host, port, timeout: connectTimeout ?? timeout ?? const Duration(seconds: 10));
   raw.setOption(SocketOption.tcpNoDelay, true);
   if (!tls) return _SocketTransport(raw);
   try {
     final secure = await SecureSocket.secure(
       raw,
       host: serverName ?? host,
-      context: mediaTlsContext,
+      context: context ?? mediaTlsContext,
     ).timeout(timeout ?? const Duration(seconds: 10));
     return _SocketTransport(secure);
   } catch (_) {
@@ -99,3 +104,15 @@ Future<MediaTransport> connectSocketTransport(
     rethrow;
   }
 }
+
+/// A [TransportConnector] over [connectSocketTransport] bound to a trust
+/// store. Relay TLS uses [context] = `TapoCloud.buildContext` (system roots
+/// plus the TP-Link roots). [maxConnect] caps the TCP connect wait (the local
+/// :8800 probe uses about 1.2 s so a failover stays under 2.5 s).
+TransportConnector socketConnector({SecurityContext? context, Duration? maxConnect}) =>
+    (String host, int port, {bool tls = false, String? serverName, Duration? timeout}) {
+      var wait = timeout;
+      if (maxConnect != null && (wait == null || maxConnect < wait)) wait = maxConnect;
+      return connectSocketTransport(host, port,
+          tls: tls, serverName: serverName, timeout: timeout, connectTimeout: wait, context: context);
+    };
