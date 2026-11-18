@@ -23,7 +23,11 @@ const String tagAdguardTls = 'adguard-tls';
 
 /// A [MediaTransport] over a dart:io socket (plain or TLS).
 class SocketMediaTransport implements MediaTransport {
-  SocketMediaTransport(this._socket);
+  SocketMediaTransport(this._socket) {
+    // Write errors after a peer reset are reported on `done`; the read side
+    // (input) already carries the failure to the protocol code.
+    _socket.done.ignore();
+  }
   final Socket _socket;
   bool _closed = false;
 

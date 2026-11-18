@@ -169,6 +169,9 @@ class MockMedia8800 {
     }
     incoming.listen((s) {
       s.setOption(SocketOption.tcpNoDelay, true);
+      // A client that resets mid-write must not surface as an uncaught
+      // 'Write failed' error in the test zone (10053/10054 on Windows).
+      s.done.ignore();
       final session = _Session(this, s);
       _sessions.add(session);
       session.run().whenComplete(() => _sessions.remove(session));
