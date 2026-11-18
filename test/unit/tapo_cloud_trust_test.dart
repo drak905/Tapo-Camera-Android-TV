@@ -1,13 +1,13 @@
-// Spec hc.cloud.trust_roots. The spec target is assets/tplink_roots.pem (the
-// baseline asset assets/tapo-cloud-roots.pem must be renamed and listed in
-// pubspec.yaml by the orchestrator).
+// Spec hc.cloud.trust_roots. Barrier 2 decision: keep the baseline asset name
+// assets/tapo-cloud-roots.pem (already in pubspec.yaml and .gitignore allow-list)
+// instead of renaming it to the spec's tplink_roots.pem.
 
 import 'dart:io';
 
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tapo_tv/api/tapo_cloud.dart';
 
-const _asset = 'assets/tplink_roots.pem';
+const _asset = 'assets/tapo-cloud-roots.pem';
 
 void main() {
   test('asset holds two certificates', () {
