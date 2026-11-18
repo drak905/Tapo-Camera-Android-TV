@@ -116,6 +116,11 @@ class MockMedia8800 {
 
   /// Pause between preview parts (the live stream loops the TS clip forever).
   Duration previewInterval;
+
+  /// Pause between playback/download parts. Zero (default) sends the clip as fast as
+  /// the socket takes it, like before; tests that must act while a clip is still
+  /// streaming set it.
+  Duration playbackInterval = Duration.zero;
   SessionIdIn sessionIdIn;
   final String host;
   int port;
@@ -528,7 +533,11 @@ class _Session {
       for (var i = 1; i <= chunks.length; i++) {
         if (!await _waitWindow(i)) return;
         _sendMedia(i, chunks[i - 1], (3 * 90000 * (i - 1)) ~/ chunks.length, i == 1);
-        if (i % 8 == 0) await Future<void>.delayed(Duration.zero);
+        if (srv.playbackInterval > Duration.zero) {
+          await Future<void>.delayed(srv.playbackInterval);
+        } else if (i % 8 == 0) {
+          await Future<void>.delayed(Duration.zero);
+        }
       }
       if (!stopStream) {
         sendJson({

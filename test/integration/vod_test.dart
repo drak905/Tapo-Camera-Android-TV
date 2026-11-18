@@ -173,7 +173,9 @@ void main() {
 
     test('local: stop() sends the stop request and frees the camera session', () async {
       final cam = MockCamera(cloudPassword: 'cloudpass');
-      final m = MockMedia8800.forCamera(cam)..previewInterval = const Duration(milliseconds: 20);
+      // The mock sends a whole clip at once by default, so the clip could end before stop();
+      // pace it (previewInterval only paces live preview).
+      final m = MockMedia8800.forCamera(cam)..playbackInterval = const Duration(milliseconds: 20);
       final c = await startMedia8800(m);
       final first = cam.state.recordings.first;
       final session = vs.VodSession.local(
