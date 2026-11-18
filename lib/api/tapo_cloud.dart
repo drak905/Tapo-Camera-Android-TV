@@ -1,9 +1,11 @@
 // Dart port of upstream `tapo_cloud_probe.py` + the relay part of
-// `tapo_cloud_app.py` (https://github.com/filirnd/topo).
+// `tapo_cloud_app.py` (https://github.com/filirnd/topo), brought in line with
+// the Windows client (`core/cloud/client.py`, app 3.22.806).
 //
 // It talks only to the Tapo cloud: account login with MFA, device list,
-// camera control through the IoT gateway, and the CIPC video relay. The API
-// is private and undocumented; it may change without notice.
+// service discovery, camera control through the IoT gateway, and the CIPC
+// video relay. The API is private and undocumented; it may change.
+// Secrets (password, token) stay in memory and never appear in messages.
 
 import 'dart:async';
 import 'dart:convert';
@@ -11,20 +13,25 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 
-import 'package:crypto/crypto.dart';
-
 import 'cloud_transport.dart';
+import 'lan_matcher.dart' show normaliseMac;
+import 'tapo_signing.dart';
 
 const appName = 'TP-Link_Tapo_Android';
-const appVersion = '3.21.114';
+const appVersion = '3.22.806';
 const productName = 'Topo TV';
-const loginUrl = 'https://n-wap-gw.tplinkcloud.com';
+const loginUrl = 'https://n-wap.i.tplinkcloud.com';
 const defaultCipcUrl = 'https://cipc.api.cloud';
 
-// App-level credentials of the Tapo Android client. They identify the client
-// application, not the user's account.
-const _accessKey = '4d11b6b9d5ea4d19a829adbb9714b057';
-const _accessSecret = '6ed7d97f3e73467f8a5bab90b577ba4c';
+/// Service id of the IoT app server (thing list with local access tokens).
+const iotServiceId = 'nbu.iot-app-server.app-v2';
+const cipcServiceId = 'cipc.api.cloud';
+
+const _platformName = 'Android 14';
+const _jsonType = 'application/json;charset=UTF-8';
+const _requestDeviceTypes = ['SMART.IPCAMERA', 'SMART.TAPODOORBELL', 'SMART.TAPOHUB'];
+const _cameraDeviceTypes = {'SMART.IPCAMERA', 'SMART.TAPODOORBELL'};
+const _tokenErrors = {-20651, -20652, -20675};
 
 const _deviceErrorMessages = {
   -64303: 'Motor busy, wait for the movement to finish',
@@ -33,32 +40,44 @@ const _deviceErrorMessages = {
   -64336: 'Movement blocked by a privacy zone',
 };
 
-const _loginErrorMessages = {
-  -20601: 'Incorrect email or password',
-  -20600: 'Account not found',
+const _authMessages = {
+  -20004: 'Sign-in failed. Check your email and password.',
+  -20200: 'That email address is not valid.',
+  -20202: 'That user name is not valid.',
+  -20600: 'No TP-Link ID exists for this email.',
+  -20601: 'Incorrect email or password.',
+  -20602: 'This TP-Link ID is not activated yet. Open the activation email first.',
+  -20607: 'Sign-in failed. Check your email and password.',
+  -20615: 'Incorrect email or password.',
+  -20661: 'Too many failed attempts. The account is locked.',
+  -20676: 'Verification failed. Check the code and try again.',
+  -20681: 'Sign-in failed. Try again later.',
+  -20697: 'Sign-in failed. Try again later.',
+  -20708: 'Sign-in failed. Try again later.',
+};
+
+const _mfaSendPaths = {
+  1: '/api/v2/account/getPushVC4TerminalMFA',
+  2: '/api/v2/account/getEmailVC4TerminalMFA',
+  4: '/api/v2/account/getSmsVC4TerminalMFA',
 };
 
 class TapoException implements Exception {
-  TapoException(this.message, {this.code});
+  TapoException(this.message, {this.code, this.details = const {}});
   final String message;
   final int? code;
 
+  /// Cloud `result` map of the failed call (never shown to the user).
+  final Map<String, dynamic> details;
+
   /// True when the cloud session token is no longer accepted.
-  bool get isAuthError => code == -20651;
+  bool get isAuthError => _tokenErrors.contains(code);
 
   @override
   String toString() => message;
 }
 
-String randomUuid() {
-  final rng = Random.secure();
-  final b = List<int>.generate(16, (_) => rng.nextInt(256));
-  b[6] = (b[6] & 0x0f) | 0x40;
-  b[8] = (b[8] & 0x3f) | 0x80;
-  final h = b.map((v) => v.toRadixString(16).padLeft(2, '0')).join();
-  return '${h.substring(0, 8)}-${h.substring(8, 12)}-${h.substring(12, 16)}-'
-      '${h.substring(16, 20)}-${h.substring(20)}';
-}
+String randomUuid() => randomUuidV4();
 
 int errorCode(Object? value) {
   if (value is! Map) return 0;
@@ -77,18 +96,84 @@ Map<String, dynamic> resultOf(Map<String, dynamic> response) {
   return value is Map<String, dynamic> ? value : <String, dynamic>{};
 }
 
-String _describe(String what, int code) {
-  final known = _loginErrorMessages[code];
-  return known != null ? '$known ($code)' : '$what (code $code)';
+int _intCode(Object? value) {
+  if (value is int) return value;
+  return int.tryParse('${value ?? ''}'.trim()) ?? 0;
 }
 
+TapoException _errorFor(int code, String msg, Map<String, dynamic> result) {
+  final known = _authMessages[code];
+  if (known != null) {
+    var text = known;
+    final locked = result['lockedMinutes'];
+    final remain = result['remainAttempts'];
+    if (code == -20661 && locked != null && '$locked' != '0') {
+      text = 'Too many failed attempts. The account is locked for $locked minutes.';
+    } else if ((code == -20601 || code == -20615) && remain is int) {
+      text += ' $remain attempts left.';
+    }
+    return TapoException(text, code: code, details: result);
+  }
+  if (code == -23003) {
+    return TapoException('This app version is too old for the TP-Link cloud.',
+        code: code, details: result);
+  }
+  return TapoException('TP-Link cloud error $code${msg.isNotEmpty ? ': $msg' : ''}',
+      code: code, details: result);
+}
+
+String _normaliseLocale(String raw) {
+  final base = raw.split('.').first.split('@').first.replaceAll('-', '_');
+  return base.contains('_') && base.length <= 8 ? base : 'en_US';
+}
+
+/// Approximation of Python's `str.isprintable` for alias decoding.
+bool _isPrintable(String text) {
+  if (text.isEmpty) return false;
+  for (final c in text.runes) {
+    if (c < 0x20 || (c >= 0x7F && c <= 0xA0) || c == 0xAD || c == 0xFFFD) return false;
+    if (c == 0x1680 || (c >= 0x2000 && c <= 0x200F) || (c >= 0x2028 && c <= 0x202F)) return false;
+    if ((c >= 0x205F && c <= 0x206F) || c == 0x3000 || c == 0xFEFF) return false;
+    if (c >= 0xD800 && c <= 0xDFFF) return false;
+  }
+  return true;
+}
+
+final _base64Strict = RegExp(r'^[A-Za-z0-9+/]+={0,2}$');
+
+/// IoT cloud headers (never logged: they carry the session token). Not
+/// HMAC-signed. Spec: hc.cloud.iot_headers.
+Map<String, String> buildIotHeaders({
+  required String token,
+  required String terminalUuid,
+  String locale = 'en_US',
+  bool post = false,
+}) =>
+    {
+      'Authorization': 'ut|$token',
+      'app-cid': 'app:$appName:$terminalUuid',
+      'x-app-name': appName,
+      'x-app-version': appVersion,
+      'x-term-id': terminalUuid,
+      'x-ospf': _platformName,
+      'x-net-type': 'wifi',
+      'x-strict': '0',
+      'x-locale': locale,
+      'User-Agent': '$appName/$appVersion(cloud-only;AndroidTV)',
+      'Accept': 'application/json',
+      if (post) 'Content-Type': _jsonType,
+    };
 /// Result of [TapoCloud.login]: either a token or a pending MFA challenge.
 class LoginResult {
   LoginResult(this.baseUrl, this.result);
   final String baseUrl;
   final Map<String, dynamic> result;
 
-  String? get token => result['token'] as String?;
+  String? get token {
+    final t = result['token'];
+    return t is String ? t : null;
+  }
+
   String? get mfaProcessId => result['MFAProcessId']?.toString();
   List<int> get mfaTypes {
     final raw = result['supportedMFATypes'];
@@ -117,11 +202,21 @@ class RelayInfo {
 }
 
 class TapoCloud {
-  TapoCloud({required this.terminalUuid, required SecurityContext context})
+  TapoCloud({required this.terminalUuid, required SecurityContext context, String? locale})
       : _context = context,
-        _http = HttpClient(context: context)
-          ..connectionTimeout = const Duration(seconds: 15)
-          ..idleTimeout = const Duration(seconds: 30);
+        _transport = HttpCloudTransport(context),
+        locale = _normaliseLocale(locale ?? Platform.localeName);
+
+  TapoCloud._(this.terminalUuid, this._transport, this.locale) : _context = null;
+
+  /// Test/DI constructor: every request goes through [transport] instead of
+  /// `HttpClient`. [locale] is `xx_YY` (default `en_US`). Spec: hc.cloud.*.
+  factory TapoCloud.withTransport({
+    required String terminalUuid,
+    required CloudTransport transport,
+    String locale = 'en_US',
+  }) =>
+      TapoCloud._(terminalUuid, transport, _normaliseLocale(locale));
 
   /// TP-Link serves a CA chain that ships with the Tapo app but not with all
   /// trust stores. Keep the system roots and add those two public roots; TLS
@@ -132,24 +227,22 @@ class TapoCloud {
   }
 
   final String terminalUuid;
-  final SecurityContext _context;
-  final HttpClient _http;
+  final String locale;
+  final SecurityContext? _context;
+  final CloudTransport _transport;
+
+  /// Session token. Never printed.
   String token = '';
+
+  String? _email;
+  String? _password;
+  String? _region;
   String _cipcUrl = defaultCipcUrl;
-  String _cipcDiscoveryBase = '';
-  String _iotAppServer = '';
-  String _servicesSyncVersion = 'v2';
+  String _servicesSyncVersion = 'v1';
+  final Map<String, String> _serviceCache = {};
 
-  // ---- Wave 2 contract stubs (RED phase, see test/unit/tapo_cloud_test.dart) --
-
-  /// Test/DI constructor: every request goes through [transport] instead of
-  /// `HttpClient`. [locale] is `xx_YY` (default `en_US`). Spec: hc.cloud.*.
-  factory TapoCloud.withTransport({
-    required String terminalUuid,
-    required CloudTransport transport,
-    String locale = 'en_US',
-  }) =>
-      throw UnimplementedError();
+  @override
+  String toString() => 'TapoCloud(signedIn: ${token.isNotEmpty})';
 
   /// Keeps the account secrets in memory so an expired token can be renewed
   /// silently (captchaLogin once on -20651, one full login on -20652/-20675).
@@ -158,109 +251,220 @@ class TapoCloud {
     required String username,
     required String password,
     required String baseUrl,
-  }) =>
-      throw UnimplementedError();
+  }) {
+    _email = username;
+    _password = password;
+    _region = baseUrl.replaceAll(RegExp(r'/+$'), '');
+  }
 
-  /// Signed `getAppServiceUrl` call for [serviceIds]. Values that are not
-  /// non-empty strings are dropped and a trailing `/` is stripped. The result
-  /// is cached per session and cleared on re-login. Spec: hc.cloud.service_urls.
-  Future<Map<String, String>> serviceUrls(String baseUrl, List<String> serviceIds) =>
-      throw UnimplementedError();
-
-  /// URL of `nbu.iot-app-server.app-v2`. Throws [TapoException] when the
-  /// scheme is not http(s) or the URL is plain http while the account API is
-  /// https. Spec: hc.cloud.service_urls.
-  Future<String> discoverIotServer(String baseUrl) => throw UnimplementedError();
-
-  /// URL of `cipc.api.cloud`, used by the player lane's relay request together
-  /// with [token] and [postCipc].
-  Future<String> discoverCipcUrl(String baseUrl) => throw UnimplementedError();
-
-  /// IoT headers (Authorization `ut|<token>`, app-cid, x-*; no HMAC headers).
-  /// Spec: hc.cloud.iot_headers.
-  Map<String, String> iotHeaders({bool post = false}) => throw UnimplementedError();
-
-  /// Plain alias or Base64 alias (only when len%4==0, len>=4, strict base64 of
-  /// printable UTF-8 that re-encodes identically). Spec: hc.cloud.alias_decode.
-  static String decodeAlias(String alias) => throw UnimplementedError();
-
-  /// Display alias of a device-list entry: decoded alias, else deviceName, else model.
-  static String aliasOf(Map<String, dynamic> device) => throw UnimplementedError();
-  void close() => _http.close(force: true);
+  void close() => _transport.close();
 
   // ---------------------------------------------------------------- HTTP --
 
   static Uint8List _body(Map<String, dynamic> payload) =>
       Uint8List.fromList(utf8.encode(jsonEncode(payload)));
 
-  Map<String, String> _signedHeaders(Uint8List body, String endpoint) {
-    final nonce = randomUuid();
-    const timestamp = '9999999999';
-    final contentMd5 = base64.encode(md5.convert(body).bytes);
-    final message = [contentMd5, timestamp, nonce, endpoint].join('\n');
-    final signature = Hmac(sha1, utf8.encode(_accessSecret))
-        .convert(utf8.encode(message))
-        .toString();
-    return {
-      'Content-Type': 'application/json; charset=UTF-8',
-      'Content-MD5': contentMd5,
-      'X-Authorization': 'Timestamp=$timestamp, Nonce=$nonce, '
-          'AccessKey=$_accessKey, Signature=$signature',
-      'User-Agent': 'okhttp/3.12.13',
-    };
-  }
-
   Future<(int, Map<String, dynamic>)> _postRaw(
     Uri uri,
     Uint8List body,
     Map<String, String> headers,
   ) async {
-    final HttpClientResponse response;
+    final CloudResponse response;
     try {
-      final request = await _http.postUrl(uri);
-      headers.forEach((k, v) => request.headers.set(k, v, preserveHeaderCase: true));
-      request.contentLength = body.length;
-      request.add(body);
-      response = await request.close().timeout(const Duration(seconds: 30));
-    } on SocketException catch (e) {
-      throw TapoException('Network error: ${e.osError?.message ?? e.message}');
-    } on HandshakeException catch (e) {
-      throw TapoException('Secure connection failed: ${e.message}');
-    } on TimeoutException {
-      throw TapoException('The Tapo cloud did not answer in time');
-    } on HttpException catch (e) {
-      throw TapoException('Network error: ${e.message}');
+      response = await _transport.send(CloudRequest(
+        method: 'POST',
+        uri: uri,
+        headers: headers,
+        body: body,
+      ));
+    } on CloudTransportError catch (e) {
+      throw TapoException(e.message);
     }
-    final raw = await response.fold<BytesBuilder>(
-      BytesBuilder(copy: false),
-      (b, chunk) => b..add(chunk),
-    );
     Object? decoded;
     try {
-      decoded = jsonDecode(utf8.decode(raw.takeBytes()));
+      decoded = jsonDecode(utf8.decode(response.body));
     } on FormatException {
       decoded = null;
     }
     if (decoded is! Map<String, dynamic>) {
-      if (response.statusCode >= 400) {
-        throw TapoException('Cloud rejected the request (HTTP ${response.statusCode})');
+      if (response.status >= 400) {
+        throw TapoException('Cloud rejected the request (HTTP ${response.status})',
+            code: response.status);
       }
       throw TapoException('Unexpected answer from the Tapo cloud');
     }
-    return (response.statusCode, decoded);
+    return (response.status, decoded);
   }
 
-  Future<Map<String, dynamic>> post(
+  Map<String, String> _commonQuery({required bool withToken}) => {
+        'appName': appName,
+        'appVer': appVersion,
+        'netType': 'wifi',
+        'termID': terminalUuid,
+        'ospf': _platformName,
+        'brand': 'TPLINK',
+        'locale': locale,
+        if (withToken && token.isNotEmpty) 'token': token,
+      };
+
+  /// Signed POST of the account API; returns the `result` map or throws.
+  Future<Map<String, dynamic>> _call(
     String baseUrl,
     String endpoint,
     Map<String, dynamic> payload, {
-    required bool withToken,
+    bool withToken = false,
   }) async {
+    final base = Uri.tryParse(baseUrl.replaceAll(RegExp(r'/+$'), ''));
+    if (base == null || (base.scheme != 'https' && base.scheme != 'http') || base.host.isEmpty) {
+      throw TapoException('Invalid cloud URL');
+    }
     final body = _body(payload);
-    var uri = Uri.parse(baseUrl.replaceAll(RegExp(r'/+$'), '') + endpoint);
-    if (withToken) uri = uri.replace(queryParameters: {'token': token});
-    final (_, decoded) = await _postRaw(uri, body, _signedHeaders(body, endpoint));
-    return decoded;
+    final uri = base.replace(
+      path: '${base.path}$endpoint',
+      queryParameters: _commonQuery(withToken: withToken),
+    );
+    final signed = signCloudRequest(body: body, url: uri);
+    final (status, env) = await _postRaw(uri, body, {
+      'Content-Type': _jsonType,
+      'Accept': 'application/json',
+      'Content-MD5': signed.contentMd5,
+      'X-Authorization': signed.xAuthorization,
+      'User-Agent': 'okhttp/3.12.13',
+    });
+    final result = resultOf(env);
+    var code = _intCode(env['errorCode']);
+    if (code == 0) code = _intCode(result['errorCode']);
+    if (code != 0) {
+      throw _errorFor(code, '${env['msg'] ?? result['errorMsg'] ?? ''}', result);
+    }
+    if (status >= 400) throw TapoException('TP-Link cloud HTTP error $status', code: status);
+    return result;
+  }
+
+  /// Signed call with the session token; renews an expired token once.
+  Future<Map<String, dynamic>> _signedCall(
+    String baseUrl,
+    String endpoint,
+    Map<String, dynamic> payload,
+  ) async {
+    var relogged = false;
+    while (true) {
+      try {
+        return await _call(baseUrl, endpoint, payload, withToken: true);
+      } on TapoException catch (e) {
+        if (relogged || !_tokenErrors.contains(e.code)) rethrow;
+        relogged = true;
+        await _relogin(captcha: e.code == -20651);
+      }
+    }
+  }
+
+  /// Silent re-login with the stored credentials [spec hc.cloud.token_refresh].
+  Future<void> _relogin({required bool captcha}) async {
+    final email = _email, password = _password, region = _region;
+    if (email == null || password == null || region == null) {
+      throw TapoException('Session expired, sign in again', code: -20651);
+    }
+    token = '';
+    _serviceCache.clear();
+    final result = await _call(
+      region,
+      captcha ? '/api/v2/account/captchaLogin' : '/api/v2/account/login',
+      _loginPayload(email, password),
+    );
+    final fresh = result['token'];
+    if (fresh is! String || fresh.isEmpty) {
+      throw TapoException('The TP-Link cloud returned no session token');
+    }
+    token = fresh;
+  }
+
+  // ------------------------------------------------------------ Services --
+
+  /// Signed `getAppServiceUrl` call for [serviceIds]. Values that are not
+  /// non-empty strings are dropped and a trailing `/` is stripped. The result
+  /// is cached per session and cleared on re-login. Spec: hc.cloud.service_urls.
+  Future<Map<String, String>> serviceUrls(String baseUrl, List<String> serviceIds) async {
+    final ids = serviceIds.where((s) => s.isNotEmpty).toList();
+    if (ids.isEmpty) return {};
+    final missing = ids.where((s) => !_serviceCache.containsKey(s)).toList();
+    if (missing.isNotEmpty) {
+      final result = await _signedCall(
+        baseUrl,
+        '/api/v2/common/getAppServiceUrl',
+        {'serviceIds': missing},
+      );
+      final urls = result['serviceUrls'];
+      if (urls is Map) {
+        urls.forEach((k, v) {
+          if (v is String && v.isNotEmpty) {
+            _serviceCache['$k'] = v.replaceAll(RegExp(r'/+$'), '');
+          }
+        });
+      }
+    }
+    return {
+      for (final id in ids)
+        if (_serviceCache.containsKey(id)) id: _serviceCache[id]!,
+    };
+  }
+
+  /// URL of `nbu.iot-app-server.app-v2`. Throws [TapoException] when the
+  /// scheme is not http(s) or the URL is plain http while the account API is
+  /// https. Spec: hc.cloud.service_urls.
+  Future<String> discoverIotServer(String baseUrl) async {
+    final url = (await serviceUrls(baseUrl, [iotServiceId]))[iotServiceId] ?? '';
+    final parsed = Uri.tryParse(url);
+    if (parsed == null ||
+        (parsed.scheme != 'http' && parsed.scheme != 'https') ||
+        parsed.host.isEmpty) {
+      _serviceCache.remove(iotServiceId);
+      throw TapoException('The TP-Link cloud returned no IoT server address');
+    }
+    if (baseUrl.startsWith('https://') && parsed.scheme != 'https') {
+      _serviceCache.remove(iotServiceId);
+      throw TapoException('The TP-Link cloud returned an insecure IoT server address');
+    }
+    return url;
+  }
+
+  /// URL of `cipc.api.cloud`, used by the player lane's relay request together
+  /// with [token] and [postCipc].
+  Future<String> discoverCipcUrl(String baseUrl) async {
+    final url = (await serviceUrls(baseUrl, [cipcServiceId]))[cipcServiceId];
+    if (url == null) throw TapoException('$cipcServiceId endpoint missing from cloud response');
+    return url;
+  }
+
+  /// IoT headers (Authorization `ut|<token>`, app-cid, x-*; no HMAC headers).
+  /// Spec: hc.cloud.iot_headers.
+  Map<String, String> iotHeaders({bool post = false}) =>
+      buildIotHeaders(token: token, terminalUuid: terminalUuid, locale: locale, post: post);
+
+  /// Plain alias or Base64 alias (only when len%4==0, len>=4, strict base64 of
+  /// printable UTF-8 that re-encodes identically). Spec: hc.cloud.alias_decode.
+  static String decodeAlias(String alias) {
+    if (alias.isEmpty || alias.length % 4 != 0 || !_base64Strict.hasMatch(alias)) return alias;
+    try {
+      final raw = base64.decode(alias);
+      final text = utf8.decode(raw);
+      if (!_isPrintable(text) || base64.encode(raw) != alias) return alias;
+      return text;
+    } on FormatException {
+      return alias;
+    }
+  }
+
+  /// Display alias of a device-list entry: decoded alias, else deviceName, else model.
+  static String aliasOf(Map<String, dynamic> device) {
+    final decoded = decodeAlias('${device['alias'] ?? ''}');
+    if (decoded.isNotEmpty) return decoded;
+    final name = '${device['deviceName'] ?? ''}';
+    return name.isNotEmpty ? name : '${device['deviceModel'] ?? ''}';
+  }
+
+  Future<void> _ensureCipc(String baseUrl) async {
+    _cipcUrl = await discoverCipcUrl(baseUrl);
   }
 
   Future<Map<String, dynamic>> postCipc(
@@ -284,36 +488,9 @@ class TapoCloud {
       });
       return decoded;
     } on TapoException {
-      _cipcDiscoveryBase = '';
+      _serviceCache.remove(cipcServiceId);
       rethrow;
     }
-  }
-
-  Future<String> _discoverService(String baseUrl, String serviceId) async {
-    final response = await post(
-      baseUrl,
-      '/api/v2/common/getAppServiceUrl',
-      {
-        'serviceIds': [serviceId],
-      },
-      withToken: true,
-    );
-    final code = errorCode(response);
-    if (code != 0) {
-      throw TapoException('Service discovery rejected (code $code)', code: code);
-    }
-    final services = resultOf(response)['serviceUrls'];
-    final url = services is Map ? services[serviceId] : null;
-    if (url == null || '$url'.isEmpty) {
-      throw TapoException('$serviceId endpoint missing from cloud response');
-    }
-    return '$url'.replaceFirst('http://', 'https://');
-  }
-
-  Future<void> _ensureCipc(String baseUrl) async {
-    if (_cipcDiscoveryBase == baseUrl) return;
-    _cipcUrl = await _discoverService(baseUrl, 'cipc.api.cloud');
-    _cipcDiscoveryBase = baseUrl;
   }
 
   // --------------------------------------------------------------- Login --
@@ -321,59 +498,66 @@ class TapoCloud {
   Map<String, dynamic> _loginPayload(String username, String password) => {
         'appType': appName,
         'appVersion': appVersion,
-        'cloudPassword': password,
         'cloudUserName': username,
-        'platform': 'Android 14',
+        'cloudPassword': password,
+        'platform': _platformName,
         'refreshTokenNeeded': false,
-        'supportBindAccount': false,
-        'terminalMeta': '1',
-        'terminalName': '$productName - Android TV',
         'terminalUUID': terminalUuid,
+        'terminalName': '$productName - Android TV',
+        'terminalMeta': '1',
       };
 
+  /// Signs in: `getAccountStatusAndUrl` finds the regional URL, then `login`
+  /// (one `-20212` region redirect is followed). A pending MFA challenge is
+  /// returned as a [LoginResult] without token. Spec: hc.cloud.login_region.
   Future<LoginResult> login(String username, String password) async {
-    final payload = _loginPayload(username, password);
-    var response = await post(loginUrl, '/api/v2/account/login', payload, withToken: false);
-    var code = errorCode(response);
-    if (code != 0) throw TapoException(_describe('Login rejected', code), code: code);
-    var result = resultOf(response);
-    // Accounts outside the global region are redirected to a regional URL.
-    if (errorCode(result) == -20212 && result['appServerUrl'] != null) {
-      final regional = '${result['appServerUrl']}';
-      response = await post(regional, '/api/v2/account/login', payload, withToken: false);
-      code = errorCode(response);
-      if (code != 0) throw TapoException(_describe('Login rejected', code), code: code);
-      result = resultOf(response);
-      return LoginResult(regional, result);
+    final status = await _call(loginUrl, '/api/v2/account/getAccountStatusAndUrl', {
+      'appType': appName,
+      'cloudUserName': username,
+    });
+    var region = '${status['appServerUrlV2'] ?? ''}'.replaceAll(RegExp(r'/+$'), '');
+    if (region.isEmpty) region = loginUrl;
+    Map<String, dynamic> result;
+    try {
+      try {
+        result = await _call(region, '/api/v2/account/login', _loginPayload(username, password));
+      } on TapoException catch (e) {
+        final redirect = '${e.details['appServerUrlV2'] ?? ''}'.replaceAll(RegExp(r'/+$'), '');
+        if (e.code != -20212 || redirect.isEmpty || redirect == region) rethrow;
+        region = redirect;
+        result = await _call(region, '/api/v2/account/login', _loginPayload(username, password));
+      }
+    } on TapoException catch (e) {
+      if (e.code == -20677) {
+        // MFA challenge: the caller continues with requestMfa/verifyMfa.
+        _email = username;
+        _password = password;
+        _region = region;
+        return LoginResult(region, Map<String, dynamic>.of(e.details));
+      }
+      rethrow;
     }
-    final inner = errorCode(result);
-    if (inner != 0 && result['MFAProcessId'] == null) {
-      throw TapoException(_describe('Login rejected', inner), code: inner);
+    final fresh = result['token'];
+    if (fresh is! String || fresh.isEmpty) {
+      throw TapoException('The TP-Link cloud returned no session token');
     }
-    return LoginResult(loginUrl, result);
+    token = fresh;
+    rememberCredentials(username: username, password: password, baseUrl: region);
+    return LoginResult(region, result);
   }
 
-  /// [mfaType] 1 = push to the Tapo phone app, 2 = email code.
+  /// [mfaType] 1 = push to the Tapo phone app, 2 = email code, 4 = SMS,
+  /// 3 = authenticator app (nothing to send).
   Future<void> requestMfa(String baseUrl, String username, String password, int mfaType) async {
-    final endpoint = mfaType == 1
-        ? '/api/v2/account/getPushVC4TerminalMFA'
-        : '/api/v2/account/getEmailVC4TerminalMFA';
-    final sent = await post(
-      baseUrl,
-      endpoint,
-      {
-        'appType': appName,
-        'cloudPassword': password,
-        'cloudUserName': username,
-        'terminalUUID': terminalUuid,
-      },
-      withToken: false,
-    );
-    final outer = errorCode(sent), inner = errorCode(resultOf(sent));
-    if (outer != 0 || inner != 0) {
-      final code = inner != 0 ? inner : outer;
-      throw TapoException(_describe('Could not send the verification code', code), code: code);
-    }
+    if (mfaType == 3) return;
+    final endpoint = _mfaSendPaths[mfaType] ?? _mfaSendPaths[2]!;
+    await _call(baseUrl, endpoint, {
+      'appType': appName,
+      'cloudUserName': username,
+      'cloudPassword': password,
+      'terminalUUID': terminalUuid,
+      if (mfaType == 2 || mfaType == 4) 'locale': locale,
+    });
   }
 
   Future<Map<String, dynamic>> verifyMfa(
@@ -383,68 +567,57 @@ class TapoCloud {
     String processId,
     int mfaType,
   ) async {
-    final checked = await post(
-      baseUrl,
-      '/api/v2/account/checkMFACodeAndLogin',
-      {
-        'appType': appName,
-        'cloudUserName': username,
-        'code': code,
-        'MFAProcessId': processId,
-        'MFAType': mfaType,
-        'terminalBindEnabled': true,
-      },
-      withToken: false,
-    );
-    final outer = errorCode(checked), inner = errorCode(resultOf(checked));
-    if (outer != 0 || inner != 0) {
-      final c = inner != 0 ? inner : outer;
-      throw TapoException(_describe('Verification code rejected', c), code: c);
+    final result = await _call(baseUrl, '/api/v2/account/checkMFACodeAndLogin', {
+      'appType': appName,
+      'cloudUserName': username,
+      'code': code.trim(),
+      'MFAProcessId': processId,
+      'MFAType': mfaType,
+      'terminalBindEnabled': true,
+    });
+    final fresh = result['token'];
+    if (fresh is String && fresh.isNotEmpty) {
+      token = fresh;
+      _region = baseUrl.replaceAll(RegExp(r'/+$'), '');
+      _email = username;
     }
-    return resultOf(checked);
+    return result;
   }
 
   // ------------------------------------------------------------- Devices --
 
+  /// Camera-like devices of the account (hubs and id-less entries dropped,
+  /// duplicates ignored, MAC normalised). Renews an expired token once.
   Future<List<Map<String, dynamic>>> listCameras(String baseUrl) async {
-    final devices = <Map<String, dynamic>>[];
-    for (var index = 0; index < 200; index += 20) {
-      final response = await post(
-        baseUrl,
-        '/api/v2/common/getDeviceListByPage',
-        {
-          'deviceTypeList': ['SMART.IPCAMERA'],
-          'index': index,
-          'limit': 20,
-        },
-        withToken: true,
-      );
-      final code = errorCode(response);
-      if (code != 0) {
-        throw TapoException('Could not load cameras (code $code)', code: code);
+    final devices = <String, Map<String, dynamic>>{};
+    var index = 0;
+    for (var pages = 0; pages < 500; pages++) {
+      final page = await _signedCall(baseUrl, '/api/v2/common/getDeviceListByPage', {
+        'deviceTypeList': _requestDeviceTypes,
+        'index': index,
+        'limit': 20,
+      });
+      final raw = page['deviceList'];
+      final items = raw is List ? raw : const [];
+      for (final item in items) {
+        if (item is! Map<String, dynamic>) continue;
+        final id = item['deviceId'];
+        if (id is! String || id.isEmpty || !_cameraDeviceTypes.contains(item['deviceType'])) {
+          continue;
+        }
+        final mac = '${item['deviceMac'] ?? ''}';
+        devices.putIfAbsent(id, () {
+          final copy = Map<String, dynamic>.of(item);
+          final normal = normaliseMac(mac);
+          copy['deviceMac'] = normal.isNotEmpty ? normal : mac.toUpperCase();
+          return copy;
+        });
       }
-      final page = resultOf(response)['deviceList'];
-      if (page is! List) break;
-      devices.addAll(page.whereType<Map<String, dynamic>>());
-      final total = resultOf(response)['totalNum'];
-      if (page.length < 20 || (total is int && devices.length >= total)) break;
+      index += 20;
+      if (items.isEmpty || index >= _intCode(page['totalNum'])) break;
     }
-    return devices;
+    return devices.values.toList();
   }
-
-  Map<String, String> _iotHeaders() => {
-        'Authorization': 'ut|$token',
-        'app-cid': 'app:$appName:$terminalUuid',
-        'x-app-name': appName,
-        'x-app-version': appVersion,
-        'x-term-id': terminalUuid,
-        'x-ospf': 'Android 14',
-        'x-net-type': 'wifi',
-        'x-strict': '0',
-        'x-locale': 'en_US',
-        'Content-Type': 'application/json; charset=UTF-8',
-        'User-Agent': '$appName/$appVersion(cloud-only;AndroidTV)',
-      };
 
   /// Send camera control methods through Tapo's IoT cloud gateway.
   Future<List<dynamic>> servicesSync(
@@ -452,9 +625,7 @@ class TapoCloud {
     String deviceId,
     List<Map<String, dynamic>> requests,
   ) async {
-    if (_iotAppServer.isEmpty) {
-      _iotAppServer = await _discoverService(baseUrl, 'nbu.iot-app-server.app');
-    }
+    final iotAppServer = await discoverIotServer(baseUrl);
     final body = _body({
       'inputParams': {
         'requestData': {
@@ -465,13 +636,13 @@ class TapoCloud {
       'serviceId': 'passthrough',
     });
     Uri url(String version) => Uri.parse(
-        '${_iotAppServer.replaceAll(RegExp(r'/+$'), '')}/$version/things/'
+        '${iotAppServer.replaceAll(RegExp(r'/+$'), '')}/$version/things/'
         '${Uri.encodeComponent(deviceId)}/services-sync');
-    var (status, decoded) = await _postRaw(url(_servicesSyncVersion), body, _iotHeaders());
+    var (status, decoded) = await _postRaw(url(_servicesSyncVersion), body, iotHeaders(post: true));
     if ({404, 405, 501}.contains(status) && _servicesSyncVersion == 'v2') {
       // Older regional gateways only expose v1.
       _servicesSyncVersion = 'v1';
-      (status, decoded) = await _postRaw(url('v1'), body, _iotHeaders());
+      (status, decoded) = await _postRaw(url('v1'), body, iotHeaders(post: true));
     }
     if (status >= 400) {
       final msg = decoded['message'] ?? decoded['msg'];
@@ -668,7 +839,7 @@ class TapoCloud {
       socket = await SecureSocket.connect(
         relay.host,
         relay.port,
-        context: _context,
+        context: _context ?? SecurityContext(withTrustedRoots: true),
         timeout: const Duration(seconds: 15),
       );
     } on SocketException catch (e) {
