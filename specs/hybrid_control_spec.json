@@ -1,0 +1,1512 @@
+{
+  "lane": "hybrid_control",
+  "items": [
+    {
+      "id": "hc.cloud.signing",
+      "title": "Cloud request signing (Content-MD5 + X-Authorization HMAC-SHA1)",
+      "facts": "Content-MD5 = base64(MD5(body)); empty body is sent AND hashed as '{}'. X-Authorization = 'Timestamp=9999999999, Nonce=<uuid4 lowercase>, AccessKey=<AK>, Signature=<hex lower HMAC-SHA1(SecretKey, md5+LF+9999999999+LF+nonce+LF+path)>'. path = encoded URL path only, incl. any regional path prefix, NO query, NO host. Timestamp is a constant. AK/SK are app constants (already in baseline tapo_cloud.dart). Body bytes = compact JSON UTF-8, no ASCII escaping; hash the exact bytes sent. IoT (services-sync, /v2/things) calls are NOT signed.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/signing.py:21",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/signing.py:26",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/signing.py:31"
+      ],
+      "spec_refs": [
+        "[spec:cloud.signing]",
+        "[spec:cloud.signing.keys]"
+      ],
+      "target": "lib/api/tapo_signing.dart (new; baseline has _signedHeaders in tapo_cloud.dart:148)",
+      "tier": 1,
+      "tests": [
+        "test/unit/tapo_signing_test.dart: golden vector byte exact",
+        "test/unit/tapo_signing_test.dart: empty body hashes braces",
+        "test/unit/tapo_signing_test.dart: path excludes query"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "signing_golden",
+          "input": {
+            "secret": "6ed7d97f3e73467f8a5bab90b577ba4c",
+            "access_key": "4d11b6b9d5ea4d19a829adbb9714b057",
+            "body": "{\"appType\":\"TP-Link_Tapo_Android\",\"cloudUserName\":\"user@example.com\"}",
+            "path": "/api/v2/account/getAccountStatusAndUrl",
+            "nonce": "2f1a6c3e-8b7d-4e21-9a55-0c4d3b2a1f00"
+          },
+          "expected": {
+            "content_md5": "Tm1i6bgNP+L0b9fkTC+BUA==",
+            "signature": "d3e911ddfed0a8f151fa2d9ceef11062fc3a1a6f",
+            "x_authorization": "Timestamp=9999999999, Nonce=2f1a6c3e-8b7d-4e21-9a55-0c4d3b2a1f00, AccessKey=4d11b6b9d5ea4d19a829adbb9714b057, Signature=d3e911ddfed0a8f151fa2d9ceef11062fc3a1a6f"
+          },
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_cloud_signing.py:29"
+        },
+        {
+          "name": "empty_body_md5",
+          "input": "",
+          "expected": "mZFLkyvTelC5g8XnyQrpOw==",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_cloud_signing.py:38"
+        }
+      ]
+    },
+    {
+      "id": "hc.cloud.trust_roots",
+      "title": "TLS trust for the TP-Link cloud (two private roots)",
+      "facts": "Cloud hosts use certs from 'tp-link-CA' (RSA, legacy) and 'TP-Link Cloud Root CA' (EC P-256) that are not in default stores. Verify against system store PLUS these two PEMs. Baseline already has buildContext(tpLinkRootsPem); confirm the asset contains BOTH roots (the EC root dated 2025 may be missing). Never disable verification for cloud hosts.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/_trust.py:10",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:140"
+      ],
+      "spec_refs": [
+        "[spec:cloud.base_urls]"
+      ],
+      "target": "assets/tplink_roots.pem + lib/api/tapo_cloud.dart (buildContext)",
+      "tier": 2,
+      "tests": [
+        "test/unit/tapo_cloud_trust_test.dart: asset holds two certificates",
+        "test/unit/tapo_cloud_trust_test.dart: context builds from asset"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.common_query",
+      "title": "Common query parameters on signed account calls",
+      "facts": "Every signed POST carries query: appName=TP-Link_Tapo_Android, appVer, netType=wifi, termID=<terminalUUID>, ospf='Android <rel>', brand=TPLINK, locale (xx_YY, default en_US), then token=<token> when the call needs it. Query is NOT part of the signature. Content-Type 'application/json;charset=UTF-8', Accept json. Baseline sends only token (and omits the common params): add them.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:568",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:576"
+      ],
+      "spec_refs": [
+        "[spec:cloud.common_query_params]"
+      ],
+      "target": "lib/api/tapo_cloud.dart (post())",
+      "tier": 2,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: query carries common params in order"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.envelope_errors",
+      "title": "Account API reply envelope and error mapping",
+      "facts": "Reply = {errorCode:int, msg, result:{...}}. Effective code = envelope errorCode, else int(result.errorCode) (string in result). Non-JSON body -> malformed error. HTTP>=400 with code 0 -> HTTP error. Known codes: -20212 region redirect (result.appServerUrlV2), -20651 token expired, -20652 token mismatch, -20675 logged in elsewhere, -20677 MFA required (result.MFAProcessId + supportedMFATypes), -20601/-20615 wrong credentials (result.remainAttempts), -20661 locked (result.lockedMinutes), -20600 no account, -20602 not activated, -20676 bad MFA code, -23003 app too old. Response cap 16 MiB; timeout 15 s (login) .",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:68",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:148",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:160",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:576"
+      ],
+      "spec_refs": [
+        "[spec:cloud.login.error_codes]",
+        "[spec:cloud.token_refresh]"
+      ],
+      "target": "lib/api/tapo_cloud.dart",
+      "tier": 2,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: error code from envelope or result",
+        "test/unit/tapo_cloud_test.dart: locked and remain attempts messages"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.login_region",
+      "title": "Cloud sign-in with regional URL discovery",
+      "facts": "1) POST {https://n-wap.i.tplinkcloud.com}/api/v2/account/getAccountStatusAndUrl {appType, cloudUserName} -> result.appServerUrlV2 (regional base, strip trailing /; fall back to bootstrap). 2) POST {regional}/api/v2/account/login body {appType, appVersion, cloudUserName, cloudPassword, platform:'Android 14', refreshTokenNeeded:false, terminalUUID, terminalName, terminalMeta:'1'}. 3) On -20212 with a DIFFERENT appServerUrlV2 in result: log in once more there. Token in result.token (required). Keep region URL; account fields email/nickname/accountId. Baseline uses bootstrap n-wap-gw.tplinkcloud.com, key appServerUrl (not ...V2) and skips getAccountStatusAndUrl: align to Windows.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:224",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:520",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:55"
+      ],
+      "spec_refs": [
+        "[spec:cloud.account_status_and_url.request]",
+        "[spec:cloud.login.request]",
+        "[spec:cloud.login.response]"
+      ],
+      "target": "lib/api/tapo_cloud.dart (login)",
+      "tier": 2,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: login follows region redirect once",
+        "test/unit/tapo_cloud_test.dart: login without token is malformed"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.mfa",
+      "title": "MFA challenge, code request and completion",
+      "facts": "Login error -20677 gives result.MFAProcessId and supportedMFATypes (1 push, 2 email, 3 TOTP, 4 SMS). Send code: POST {region}/api/v2/account/getPushVC4TerminalMFA | getEmailVC4TerminalMFA | getSmsVC4TerminalMFA body {appType, cloudUserName, cloudPassword, terminalUUID[, locale for email/SMS]}; TOTP sends nothing. Complete: POST /api/v2/account/checkMFACodeAndLogin {appType, cloudUserName, code, MFAProcessId, MFAType:int, terminalBindEnabled:true} (trusts the terminal) -> same result as login. Pending state (email, password, region, processId, types) lives in memory only; cleared on success.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:93",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:247",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:262",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:114"
+      ],
+      "spec_refs": [
+        "[spec:cloud.mfa]"
+      ],
+      "target": "lib/api/tapo_cloud.dart (requestMfa/verifyMfa), lib/state/app_state.dart (PendingMfa)",
+      "tier": 2,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: mfa required then complete",
+        "test/unit/tapo_cloud_test.dart: totp type sends no request"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.token_refresh",
+      "title": "Silent re-login on token expiry",
+      "facts": "On -20651 (expired) -> captchaLogin (/api/v2/account/captchaLogin, same body as login) with the stored password, ONCE then retry. On -20652 / -20675 -> one full /login. Persistent rejection after one re-login raises. Needs the password in memory (Windows keeps it in DPAPI vault when 'keep me signed in'). Baseline stores only the token and has no refresh path: decide password storage (see decisions).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:274",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:541",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:341"
+      ],
+      "spec_refs": [
+        "[spec:cloud.token_refresh]"
+      ],
+      "target": "lib/api/tapo_cloud.dart, lib/state/app_state.dart",
+      "tier": 3,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: expired token relogs in once",
+        "test/unit/tapo_cloud_test.dart: second rejection is not retried"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.device_list_v2",
+      "title": "Device list v2 (paged) and camera filtering",
+      "facts": "POST {region}/api/v2/common/getDeviceListByPage?token=.. body {deviceTypeList:['SMART.IPCAMERA','SMART.TAPODOORBELL','SMART.TAPOHUB'], index, limit:20}; index += 20 until empty page or index >= result.totalNum (cap 500 pages). Keep only deviceType in {SMART.IPCAMERA, SMART.TAPODOORBELL} with non-empty deviceId; dedupe by deviceId. Fields: deviceId, deviceMac (normalise to AA-BB-CC-DD-EE-FF), deviceModel|deviceName, alias, deviceType, status, fwVer, deviceHwVer, role (0 owner, non-zero shared). v2 'status' is NOT a reliable online flag (0 for streaming cameras).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:274",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:550",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:61"
+      ],
+      "spec_refs": [
+        "[spec:cloud.device_list]",
+        "[spec:cloud.device_list.response]"
+      ],
+      "target": "lib/api/tapo_cloud.dart (listCameras)",
+      "tier": 2,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: device list pages and filters doorbell",
+        "test/unit/tapo_cloud_test.dart: hub is dropped"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.service_urls",
+      "title": "Service URL discovery (getAppServiceUrl)",
+      "facts": "Signed POST {region}/api/v2/common/getAppServiceUrl?token=.. body {serviceIds:[...]} -> result.serviceUrls {id: url}; drop non-string/empty values, strip trailing /. IoT app server id is 'nbu.iot-app-server.app-v2' (baseline asks 'nbu.iot-app-server.app': switch to -v2). Reject URL whose scheme is not http(s) or that is http while the account API is https (refuse insecure IoT URL). Cache per session; clear on re-login.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:304",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:76",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:352"
+      ],
+      "spec_refs": [
+        "[spec:lat.cloud.base_url]"
+      ],
+      "target": "lib/api/tapo_cloud.dart (_discoverService)",
+      "tier": 2,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: service urls signed with token",
+        "test/unit/tapo_cloud_test.dart: insecure iot url refused"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.iot_headers",
+      "title": "IoT cloud headers (not HMAC-signed)",
+      "facts": "Authorization: 'ut|<token>', app-cid: 'app:TP-Link_Tapo_Android:<terminalUUID>', x-app-name, x-app-version, x-term-id, x-ospf 'Android 14', x-net-type 'wifi', x-strict '0', x-locale (xx_YY), User-Agent, Accept json; POST adds 'Content-Type: application/json;charset=UTF-8'. No Content-MD5 / X-Authorization.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:377",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:397"
+      ],
+      "spec_refs": [
+        "[spec:lat.cloud.headers]"
+      ],
+      "target": "lib/api/tapo_cloud.dart (_iotHeaders baseline:387)",
+      "tier": 1,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: iot headers and no x-authorization"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.iot_things",
+      "title": "IoT thing list: role, status, appServerUrlV2, localAccessToken",
+      "facts": "GET {iot}/v2/things?page=N&pageSize=100&deviceTypes=SMART.IPCAMERA,SMART.TAPODOORBELL,SMART.TAPOHUB&includePcDevice=false&includeKasaShareDevices=true&includeMatterDevice=false&includeExternalVendorDeviceInfo=true with IoT headers. Reply {code:0, data:[thing...], total}. Per thing: thingName|deviceId (key), status (int; ==1 online), role (int, 0 owner), shareType (string), appServerUrlV2|appServerUrl (thing URL for services-sync, strip /), deviceType, model, localAccessToken (non-empty string = LAT mode). Index both thingName and deviceId. Stop when items empty, seen>=total, or (no total and len<100). HTTP 401 or code in {-20651,-20652,-20675} -> token error -> one re-login (reset cached IoT URL). Skip malformed entries; never log tokens.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:437",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:426",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:489",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:320"
+      ],
+      "spec_refs": [
+        "[spec:lat.source.thing_list]",
+        "[spec:lat.cloud.headers]"
+      ],
+      "target": "lib/api/iot_things.dart (new)",
+      "tier": 2,
+      "tests": [
+        "test/unit/iot_things_test.dart: query and headers",
+        "test/unit/iot_things_test.dart: pages until total",
+        "test/unit/iot_things_test.dart: missing null empty token left out",
+        "test/unit/iot_things_test.dart: 401 maps to token expired"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.online_state",
+      "title": "Online state rule",
+      "facts": "online = IoT thing status == 1 (bool from int, bools rejected) OR camera answered TDP on the LAN. Device-list v2 'status' is unreliable. If the thing list fetch fails keep the previous online map; if no thing record, fall back to device list status != 0.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:376",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:427",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:552"
+      ],
+      "spec_refs": [
+        "[spec:lat.source.thing_list]"
+      ],
+      "target": "lib/state/app_state.dart (Camera.online)",
+      "tier": 3,
+      "tests": [
+        "test/unit/camera_state_test.dart: online from thing status or lan"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.cloud.terminal_uuid",
+      "title": "Terminal UUID",
+      "facts": "32 uppercase hex chars (UUID without dashes), generated once and persisted; sent as terminalUUID / termID / x-term-id. Baseline _newClient already does this; move it to secure store with the token. Logout clears it in baseline (kTerminal removed): keep it stable across sign-out/in to avoid MFA prompts.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:72",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:75"
+      ],
+      "spec_refs": [
+        "[spec:cloud.terminal_uuid]"
+      ],
+      "target": "lib/state/app_state.dart (_newClient:160)",
+      "tier": 3,
+      "tests": [
+        "test/unit/app_state_test.dart: terminal uuid format and stability"
+      ],
+      "priority": "P1"
+    },
+    {
+      "id": "hc.cloud.alias_decode",
+      "title": "Alias decoding",
+      "facts": "alias from device list is plain UTF-8 normally. Treat as Base64 ONLY when len%4==0, len>=4, strict base64 decodes to printable UTF-8 and re-encodes to the same string; else keep verbatim. Fall back to deviceName, then model.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/client.py:126"
+      ],
+      "spec_refs": [
+        "[spec:cloud.device_list.response]"
+      ],
+      "target": "lib/api/tapo_cloud.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: decode alias plain vs base64"
+      ],
+      "priority": "P2"
+    },
+    {
+      "id": "hc.discovery.tdp_packet",
+      "title": "TDP v2 probe packet (UDP 20002 and 20004)",
+      "facts": "Packet = 16-byte big-endian header + compact JSON. Header: u8 version=2, u8 reserved=0, u16 opcode=1, u16 payloadLen, u8 flags (0x11 broadcast request = 0x10|0x01; 0x21 unicast), u8 ret=0, u32 serial (random < 2^28), u32 CRC32. CRC32 (IEEE/zlib) computed over the whole packet with bytes 12..15 set to 0x5A6B7C8D, result written big-endian at 12. Payload {\"params\":{\"rsa_key\":\"<PEM SubjectPublicKeyInfo RSA-2048>\"}} compact. One RSA key pair per process, reused. Send 3 probes 0.3 s apart to 255.255.255.255 and each interface directed broadcast, ports 20002 and 20004; collect replies for ~3 s from a socket bound to an ephemeral port with SO_BROADCAST.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:62",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:67",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:252"
+      ],
+      "spec_refs": [
+        "[spec:tdp.request.packet]",
+        "[spec:tdp.transport]"
+      ],
+      "target": "lib/api/tdp_discovery.dart (new)",
+      "tier": 1,
+      "tests": [
+        "test/unit/tdp_discovery_test.dart: probe golden vector byte exact",
+        "test/unit/tdp_discovery_test.dart: crc over seeded header",
+        "test/unit/tdp_discovery_test.dart: serial out of range rejected"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "probe_golden",
+          "input": {
+            "payload": "{\"params\":{\"rsa_key\":\"TEST\"}}",
+            "serial": "0x01234567"
+          },
+          "expected": {
+            "crc32": "0x1acf2577",
+            "packet_hex": "02000001001d1100012345671acf25777b22706172616d73223a7b227273615f6b6579223a2254455354227d7d"
+          },
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tdp_packet.py:51"
+        }
+      ]
+    },
+    {
+      "id": "hc.discovery.tdp_reply",
+      "title": "TDP reply parsing and validation",
+      "facts": "Replies may be concatenated: loop while >=16 bytes remain; len==0 or truncated -> stop; CRC mismatch (recompute with seed in slot) -> stop (framing unreliable); skip packet if version!=2, ret not in {0,1} or serial != probe serial. Payload JSON {error_code:0, result:{ip, mac, device_type, device_model, device_id (MD5 upper hex, may be present next to encrypt_info), encrypt_type:[..], tpap:{pake:[..],user_hash_type?,port?}, encrypt_info:{key,data}}}. error_code != 0 or missing result -> ignore. ip from result.ip (valid IPv4) else sender address. Identity: md5 = MD5(decrypted device_id) if encrypt_info decrypts, else top-level device_id lowercased if 32-hex, else ''. http_port from decrypted http_port, 0 or invalid -> null (default 443). Dedupe by normalised MAC (first wins). Never throw on hostile datagrams.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:78",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:114",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:160"
+      ],
+      "spec_refs": [
+        "[spec:tdp.response.validation]",
+        "[spec:tdp.response.fields]"
+      ],
+      "target": "lib/api/tdp_discovery.dart",
+      "tier": 2,
+      "tests": [
+        "test/unit/tdp_discovery_test.dart: encrypted reply yields md5 and port",
+        "test/unit/tdp_discovery_test.dart: plain reply lowercases md5",
+        "test/unit/tdp_discovery_test.dart: bad crc rejected",
+        "test/unit/tdp_discovery_test.dart: serial and version mismatch ignored",
+        "test/unit/tdp_discovery_test.dart: concatenated packets",
+        "test/unit/tdp_discovery_test.dart: random bytes never throw"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "device_id_md5",
+          "input": "802200000000000000000000000000000000ABCD",
+          "expected": "e4247a931858b38594790fc6606441aa",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tdp_packet.py:24"
+        }
+      ]
+    },
+    {
+      "id": "hc.discovery.tdp_encrypt_info",
+      "title": "encrypt_info decryption (RSA-OAEP-SHA1 + AES-128-CBC)",
+      "facts": "encrypt_info = {sym_schm:'AES', key:b64, data:b64}. key_iv = RSA-OAEP(MGF1-SHA1, hash SHA1, no label) decrypt of b64(key); need >=32 bytes: AES key = key_iv[0:16], CBC IV = key_iv[16:32]. data = b64 -> AES-128-CBC -> PKCS7 unpad -> UTF-8 JSON {device_id (40-hex full id), http_port, connect_ssid, connect_type, owner}. Any failure returns {} (identity then falls back to top-level md5). Dart needs an RSA lib (pointycastle) for keygen 2048 + OAEP-SHA1; key generation on a TV CPU can take seconds: generate once, off the UI isolate, cache in memory (PEM must be SPKI with 64-char lines + trailing LF per the app, Windows uses cryptography default PEM).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:95",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:177"
+      ],
+      "spec_refs": [
+        "[spec:tdp.encrypt_info.decrypt]"
+      ],
+      "target": "lib/api/tdp_discovery.dart + pubspec (pointycastle)",
+      "tier": 1,
+      "tests": [
+        "test/unit/tdp_discovery_test.dart: decrypt_info roundtrip with generated key",
+        "test/unit/tdp_discovery_test.dart: wrong key falls back to top level md5"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.discovery.targets",
+      "title": "Broadcast target list",
+      "facts": "Targets = 255.255.255.255 plus the directed broadcast of every non-loopback, non-link-local IPv4 interface with prefix < 31, each on ports 20002 and 20004. Dart: enumerate with NetworkInterface.list(type: IPv4) (no netmask in dart:io: get prefix via Kotlin ConnectivityManager/LinkProperties over a MethodChannel, else assume /24). Replies are unicast to the probe socket; if an Android TV box drops them, hold a WifiManager.MulticastLock via MethodChannel.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:230",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/tdp.py:252"
+      ],
+      "spec_refs": [
+        "[spec:tdp.transport]"
+      ],
+      "target": "lib/api/tdp_discovery.dart + android/app/src/main/kotlin/io/github/drak905/tapo_tv/MainActivity.kt (netinfo + multicast lock channel)",
+      "tier": 4,
+      "tests": [
+        "test/unit/tdp_discovery_test.dart: targets from interface list",
+        "android: MainActivity netinfo unit test"
+      ],
+      "priority": "P1"
+    },
+    {
+      "id": "hc.discovery.matcher",
+      "title": "Cloud <-> LAN matching",
+      "facts": "normalise_mac: strip [\\s:.-], uppercase, must be 12 hex else '' ; output AA-BB-CC-DD-EE-FF. device_id_md5 = lowercase MD5 hex of the UTF-8 deviceId. Pass 1: map LAN devices by lowercased md5 (first wins) and assign to cloud devices by md5(deviceId). Pass 2: for unmatched cloud devices, match by normalised MAC among unused LAN devices. Each LAN device is used at most once; an md5 match always beats a MAC match; unmatched cloud devices are absent. Matched cameras get host=ip, https_port=http_port||443, lan_found=true, control_protocol 'tpap' when tpap_requested(raw.tpap, raw.encrypt_type).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/matcher.py:18",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/matcher.py:29",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/discovery/matcher.py:34",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:107",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:552"
+      ],
+      "spec_refs": [
+        "[spec:lan.match_rule]",
+        "[spec:lan.local_connection_params]"
+      ],
+      "target": "lib/api/lan_matcher.dart (new)",
+      "tier": 1,
+      "tests": [
+        "test/unit/lan_matcher_test.dart: normalise mac formats",
+        "test/unit/lan_matcher_test.dart: invalid mac is empty",
+        "test/unit/lan_matcher_test.dart: match by md5 golden",
+        "test/unit/lan_matcher_test.dart: md5 case insensitive",
+        "test/unit/lan_matcher_test.dart: mac fallback",
+        "test/unit/lan_matcher_test.dart: md5 wins and lan used once"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "mac_formats",
+          "input": [
+            "a0:b1:c2:00:00:01",
+            "A0-B1-C2-00-00-01",
+            "a0b1c2000001",
+            "A0B1.C200.0001",
+            " A0:B1:C2:00:00:01 "
+          ],
+          "expected": "A0-B1-C2-00-00-01",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_matcher.py:25"
+        },
+        {
+          "name": "mac_invalid",
+          "input": [
+            "",
+            "xyz",
+            "A0:B1:C2",
+            "A0B1C2000001FF",
+            "G0:B1:C2:00:00:01"
+          ],
+          "expected": "",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_matcher.py:31"
+        },
+        {
+          "name": "md5_match",
+          "input": {
+            "cloud_device_id": "802200000000000000000000000000000000ABCD",
+            "lan_md5": "e4247a931858b38594790fc6606441aa"
+          },
+          "expected": "matched",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_matcher.py:36"
+        }
+      ]
+    },
+    {
+      "id": "hc.discovery.tpap_hint",
+      "title": "TPAP selection hint from TDP",
+      "facts": "tpap_requested = tpap.pake non-empty OR '4' in encrypt_type list (str/int or list). Hint stored as control_protocol='tpap' and then login skips the v3 probe. Also user_hash_type==1 in tpap hints selects SHA256U('admin') as the register user name. Even without a hint, a -40211 reply to v3 step 1 switches to TPAP (confirmed; no fallback after that).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:483",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:107",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:416"
+      ],
+      "spec_refs": [
+        "[spec:tpap.selection]"
+      ],
+      "target": "lib/api/lan_matcher.dart + lib/api/camera_control_client.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/tpap_test.dart: tpap requested hints",
+        "test/unit/lan_matcher_test.dart: control protocol from raw"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.local.v3_hashes",
+      "title": "Secure login (encrypt_type 3) hash primitives",
+      "facts": "SHA256U = SHA-256 over UTF-8, UPPERCASE hex. MD5U = MD5 UPPERCASE hex. cnonce = 8 random bytes as 16 UPPERCASE hex chars. first_hash = SHA256U(cnonce + SHA256U(password) + nonce). expected device_confirm = first_hash + nonce + cnonce (camera proves it knows the password; compare constant-time against result.data.device_confirm BEFORE sending digest, no login attempt is spent). digest_passwd = SHA256U(SHA256U(password) + cnonce + nonce) + cnonce + nonce. In LAT mode the secret is the raw LAT instead of the password: try [LAT, password] against device_confirm and use whichever verifies.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:36",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:41",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:46",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:51",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:55",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:66",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:432"
+      ],
+      "spec_refs": [
+        "[spec:auth.secure.cnonce]",
+        "[spec:auth.secure.device_confirm]",
+        "[spec:auth.secure.digest_passwd]",
+        "[spec:lat.legacy_secure.login]"
+      ],
+      "target": "lib/api/local_crypto.dart (new)",
+      "tier": 1,
+      "tests": [
+        "test/unit/local_crypto_test.dart: md5 upper golden",
+        "test/unit/local_crypto_test.dart: sha256 upper golden",
+        "test/unit/local_crypto_test.dart: device confirm golden",
+        "test/unit/local_crypto_test.dart: verify device confirm constant time",
+        "test/unit/local_crypto_test.dart: digest passwd golden",
+        "test/unit/local_crypto_test.dart: cnonce format"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "v3_hashes",
+          "input": {
+            "password": "test_password",
+            "cnonce": "ABCDEF0123456789",
+            "nonce": "0123456789ABCDEF",
+            "seq": 1234,
+            "username": "admin"
+          },
+          "expected": {
+            "md5_upper_password": "16EC1EBB01FE02DED9B7D5447D3DFC65",
+            "sha256_upper_password": "10A6E6CC8311A3E2BCC09BF6C199ADECD5DD59408C343E926B129C4914F3CB01",
+            "first_hash": "AE0E012599836B112471EC21767309CF4A927A9053B8A9FA7917E8AB28F09D01",
+            "device_confirm": "AE0E012599836B112471EC21767309CF4A927A9053B8A9FA7917E8AB28F09D010123456789ABCDEFABCDEF0123456789",
+            "digest_passwd": "5A379DADD2ED54B76D3308115F0520E539295A1EF5C5149DBE269EB7C23ACE5EABCDEF01234567890123456789ABCDEF"
+          },
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_auth_crypto.py:24"
+        },
+        {
+          "name": "md5_of_device_id_lowercase",
+          "input": "0123456789ABCDEF0123456789ABCDEF01234567",
+          "expected": "ac80b0ccea9b65429ad9c7a0b903c025",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_auth_crypto.py:32"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.v3_session",
+      "title": "Secure session keys, cipher, envelope and tag",
+      "facts": "lsk = SHA256('lsk'+cnonce+nonce+first_hash)[0:16], ivb = SHA256('ivb'+cnonce+nonce+first_hash)[0:16] (raw bytes of the digest, first 16). Cipher AES-128-CBC/PKCS7 with fixed lsk/ivb; base64 standard padded, no newlines; decrypt validates base64, positive multiple of 16, padding, UTF-8 (errors are protocol errors => session invalid). Request = compact JSON (no spaces, no ASCII escaping, no \\/ escaping) of inner dict, encrypted, wrapped as {\"method\":\"securePassthrough\",\"params\":{\"request\":\"<b64>\"}} (exact string is hashed for the tag). Headers per request: seq=<n>, tapo_tag=SHA256U(SHA256U(SHA256U(password)+cnonce) + outerBody + str(seq)). seq starts at login start_seq and increments for EVERY attempt (consumed even if the request fails). POST /stok=<stok>/ds. Reply {error_code, result:{response:<b64>}} -> decrypt -> JSON.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:82",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:92",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:97",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/crypto.py:137",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:548"
+      ],
+      "spec_refs": [
+        "[spec:auth.secure.session_keys]",
+        "[spec:auth.secure.cipher]",
+        "[spec:auth.secure.passthrough_envelope]",
+        "[spec:auth.secure.tag]",
+        "[spec:auth.secure.seq]",
+        "[spec:auth.golden_vector.v3]"
+      ],
+      "target": "lib/api/local_crypto.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/local_crypto_test.dart: derive session keys golden",
+        "test/unit/local_crypto_test.dart: compute tag golden",
+        "test/unit/local_crypto_test.dart: encrypt golden",
+        "test/unit/local_crypto_test.dart: decrypt golden",
+        "test/unit/local_crypto_test.dart: wrap secure passthrough golden",
+        "test/unit/local_crypto_test.dart: full golden pipeline",
+        "test/unit/local_crypto_test.dart: decrypt garbage is protocol error"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "v3_session_golden",
+          "input": {
+            "password": "test_password",
+            "cnonce": "ABCDEF0123456789",
+            "nonce": "0123456789ABCDEF",
+            "seq": 1234,
+            "username": "admin",
+            "inner_json": "{\"method\":\"multipleRequest\",\"params\":{\"requests\":[{\"method\":\"getDeviceInfo\",\"params\":{\"device_info\":{\"name\":[\"basic_info\"]}}}]}}"
+          },
+          "expected": {
+            "lsk_hex": "018fb84dcd026fb84e766fa42627c6df",
+            "ivb_hex": "0681a79416d607616bc1572710f41f6d",
+            "ciphertext_b64": "tsPetnY0BwryJNwfMIFkg6TmS7K69/hlPfr/0l4P3q/Ir3YMNXX0fEE1ASXzOjcW0qoTq3WZqTSc9MSNF2kA5hJJqD5UUkNw54G4WGEg/d0+IDljn04yvBwE8MLzstIcebwChQMmXfM4jJ1hTf6Gj920E5ML9J10B5ThkTJqhfG+WKfkRzTHXtMuNpHkFjOd",
+            "outer_body_json": "{\"method\":\"securePassthrough\",\"params\":{\"request\":\"tsPetnY0BwryJNwfMIFkg6TmS7K69/hlPfr/0l4P3q/Ir3YMNXX0fEE1ASXzOjcW0qoTq3WZqTSc9MSNF2kA5hJJqD5UUkNw54G4WGEg/d0+IDljn04yvBwE8MLzstIcebwChQMmXfM4jJ1hTf6Gj920E5ML9J10B5ThkTJqhfG+WKfkRzTHXtMuNpHkFjOd\"}}",
+            "tag_prefix": "965F1905CC2A04E75E383CE6F9D17CEE73D5D3C8F46CB5AF47FAD987EFCB720F",
+            "tapo_tag": "1E3CCDD1AA638ACBF781C0BE09D3510F270E61429E7E86FC56F76B636F2C6A38",
+            "http_headers": {
+              "seq": "1234",
+              "tapo_tag": "1E3CCDD1AA638ACBF781C0BE09D3510F270E61429E7E86FC56F76B636F2C6A38"
+            }
+          },
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_auth_crypto.py:249"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.login_flow",
+      "title": "Local login state machine (TPAP / secure v3 / legacy MD5)",
+      "facts": "POST / with {\"method\":\"login\",\"params\":{...}} (compact JSON). Step 1 (always): {cnonce, encrypt_type:'3', username:'admin'}. error_code -40211 -> TPAP (confirmed, no fallback). -40413 with result.data {nonce, device_confirm} -> secure v3 step 2 {cnonce, encrypt_type:'3', username, digest_passwd}; step 2 code!=0 -> auth error; result.stok + result.start_seq required. Anything else -> legacy {hashed:true, password:MD5U(password), username:'admin'}; result.stok; requests are then plain JSON on /stok=<stok>/ds without tag. If TDP hinted TPAP, skip step 1. If device_confirm matches neither LAT nor password: auth error WITHOUT sending digest. -40404/-40408 -> locked (result.data.sec_left seconds). HTTP 401 -> auth error, other non-200 -> protocol error. Session invalid on top-level or per-item -40401, securePassthrough -40210, HTTP 401: re-login once and retry once; second failure raises.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:400",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:445",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:465",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:489",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:512",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:532"
+      ],
+      "spec_refs": [
+        "[spec:auth.state_machine.login]",
+        "[spec:auth.legacy.login_request]",
+        "[spec:auth.secure.login_step1]",
+        "[spec:auth.secure.login_step2]",
+        "[spec:auth.errors.table]"
+      ],
+      "target": "lib/api/camera_control_client.dart (new)",
+      "tier": 2,
+      "tests": [
+        "test/unit/camera_control_client_test.dart: secure login step1 body exact",
+        "test/unit/camera_control_client_test.dart: secure login step2 body exact",
+        "test/unit/camera_control_client_test.dart: legacy login body exact",
+        "test/unit/camera_control_client_test.dart: wrong password sends no digest",
+        "test/unit/camera_control_client_test.dart: locked login",
+        "test/unit/camera_control_client_test.dart: per item -40401 relogins once",
+        "test/unit/camera_control_client_test.dart: persistent expiry gives up after one retry",
+        "test/unit/camera_control_client_test.dart: seq increments per request"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "legacy_login_body",
+          "input": {
+            "password": "test_password"
+          },
+          "expected": "{\"method\":\"login\",\"params\":{\"hashed\":true,\"password\":\"16EC1EBB01FE02DED9B7D5447D3DFC65\",\"username\":\"admin\"}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_control_client.py:200"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.headers_tls",
+      "title": "Local HTTPS transport: headers, TOFU pin, keep-alive",
+      "facts": "HTTPS to host:https_port (443 or TDP http_port). Headers: Accept application/json, User-Agent 'Tapo CameraClient Android', requestByApp 'true', Referer 'https://host:port', Content-Type 'application/json; charset=UTF-8' (TPAP /ds: application/octet-stream both ways), keep-alive. Camera certs are self-signed: no chain validation (badCertificateCallback) but pin sha256(DER) of the leaf on first contact per host:port (TOFU) and fail with CertificateMismatch on change; persist pins. Reuse one connection; on stale socket (reset/EOF) reconnect and resend once; timeouts are NOT retried (10 s). Serialise requests per camera (one lock) so seq cannot desync.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/transport.py:40",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/transport.py:98",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/transport.py:194",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:310"
+      ],
+      "spec_refs": [
+        "[spec:auth.tls.trust]",
+        "[spec:auth.http.common_headers]"
+      ],
+      "target": "lib/api/camera_transport.dart (new, dart:io SecurityContext + HttpClient/SecureSocket)",
+      "tier": 2,
+      "tests": [
+        "test/unit/camera_transport_test.dart: first contact pins fingerprint",
+        "test/unit/camera_transport_test.dart: changed cert raises mismatch",
+        "test/unit/camera_transport_test.dart: stale socket resent once",
+        "test/unit/camera_transport_test.dart: timeout not retried"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.local.breaker",
+      "title": "Auth circuit breaker and lockout rules",
+      "facts": "After a TapoAuthError (wrong password / device_confirm mismatch / TPAP refusal) further logins on that client fail fast with the same error for 120 s (auth_retry_after) or until reset_auth_backoff() (user re-entered password OR the camera's LAT changed => rebuild client). Lockout (-40404/-40408) is NOT breakered here: raised immediately with sec_left. TPAP: at most 2 pake_share attempts per login (MAX_ATTEMPTS=2); never loop credential variants; background callers (status poll, events) must not retry a failed login. Shared cameras (role!=0) never log in locally. Success clears the breaker.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:372",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:394",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:57",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:341"
+      ],
+      "spec_refs": [
+        "[spec:tpap.relogin]",
+        "[spec:lat.client.recommended_flow]"
+      ],
+      "target": "lib/api/camera_control_client.dart",
+      "tier": 2,
+      "tests": [
+        "test/unit/camera_control_client_test.dart: wrong password fails fast without new login attempts",
+        "test/unit/camera_control_client_test.dart: breaker expires after 120 s and reset allows retry",
+        "test/unit/camera_control_client_test.dart: lockout is not breakered",
+        "test/unit/camera_control_client_test.dart: lat change rebuilds client"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.local.tpap_register",
+      "title": "TPAP pake_register request/reply",
+      "facts": "POST / {method:'login', params:{sub_method:'pake_register', username, user_random:b64(32 random bytes), cipher_suites:[1], encryption:['aes_128_ccm'], passcode_type:'userpw'}}. username = md5hex('admin') = 21232f297a57a5a743894a0e4a801fc3 (lowercase), or SHA256U('admin') when TDP user_hash_type==1; on -40209 retry once with literal 'admin' (remember choice). Reply result: dev_random(b64), dev_salt(b64), dev_share(b64 SEC1 point), iterations (default 10000, valid 1..10_000_000), cipher_suites (must be 1), encryption (default aes_128_ccm; other -> unsupported), extra_crypt (optional). -40413 with encrypt_type ['3'] -> not TPAP (fall back to v3 unless the camera itself demanded TPAP). Lock codes -40404/-40408 stop at once.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:590",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:409",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:55",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:66"
+      ],
+      "spec_refs": [
+        "[spec:tpap.pake_register.request]",
+        "[spec:tpap.pake_register.reply]"
+      ],
+      "target": "lib/api/tpap.dart (new)",
+      "tier": 2,
+      "tests": [
+        "test/unit/tpap_test.dart: register request matches the app",
+        "test/unit/tpap_test.dart: literal admin username fallback",
+        "test/unit/tpap_test.dart: camera username hashing",
+        "test/unit/tpap_test.dart: needs v3 raises not supported"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "camera_username",
+          "input": [
+            "admin",
+            "user_hash_type=1"
+          ],
+          "expected": [
+            "21232f297a57a5a743894a0e4a801fc3",
+            "8C6976E5B5410415BDE908BD4DEE15DFB167A9C873FC4BB8A81F6F2AB448A918"
+          ],
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:176"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.tpap_spake2p",
+      "title": "SPAKE2+ (RFC 9383) prover on P-256 with SHA-256",
+      "facts": "Suite SPAKE2+-P256-SHA256-HKDF-SHA256-HMAC-SHA256 (cipher_suites 1). w0,w1 = PBKDF2-HMAC-SHA256(passcode UTF-8, dev_salt, iterations, 80 bytes): w0 = int(dk[0:40]) mod n, w1 = int(dk[40:80]) mod n. Context = SHA256('PAKE V1' || user_random || dev_random). Prover: x random in [1,n-1]; shareP = x*G + w0*M (uncompressed SEC1 65 B). Verifier share Y (dev_share) must be on the curve. z = x*(Y - w0*N), v = w1*(Y - w0*N). Transcript TT = for each of [context, idProver(empty), idVerifier(empty), M(uncomp), N(uncomp), shareP, shareV, Z, V] u64-LE length || bytes, then u64-LE 32 || w0(32 B big-endian). K_main = SHA256(TT). K_confirm = HKDF-SHA256(K_main, salt none, info 'ConfirmationKeys', 64): K_confirmP=first 32, K_confirmV=last 32. confirmP = HMAC-SHA256(K_confirmP, shareV) (sent as user_confirm); confirmV = HMAC-SHA256(K_confirmV, shareP) (must equal dev_confirm, constant-time compare; mismatch => auth error without retry). K_shared = HKDF-SHA256(K_main, none, 'SharedKey', 32). M = 02886e2f97ace46e55ba9dd7242579f2993b64e16ef3dcab95afd497333d8fa12f, N = 03d8bbd6c639c62937b04d997f38c3770719c629d7014d49a24b4f98baa1292b49 (compressed). Dart: implement with pointycastle ECCurve_secp256r1 (or BigInt affine like Windows); needs HKDF/HMAC/PBKDF2 (package:crypto has HMAC; PBKDF2 with 10k+ iterations of 80 bytes must run in an isolate).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:149",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:160",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:168",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:190",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:222"
+      ],
+      "spec_refs": [
+        "[spec:tpap.spake2p.algorithm]",
+        "[spec:tpap.spake2p.points]",
+        "[spec:tpap.context]"
+      ],
+      "target": "lib/api/tpap.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/tpap_test.dart: rfc9383 vector prover side",
+        "test/unit/tpap_test.dart: derive w0 w1 pbkdf2 80 bytes mod n",
+        "test/unit/tpap_test.dart: tpap context is sha256 of tag and randoms",
+        "test/unit/tpap_test.dart: points m n round trip",
+        "test/unit/tpap_test.dart: invalid points rejected",
+        "test/unit/tpap_test.dart: off curve peer share rejected"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "rfc9383_p256_prover",
+          "input": {
+            "context_ascii": "SPAKE2+-P256-SHA256-HKDF-SHA256-HMAC-SHA256 Test Vectors",
+            "idProver": "client",
+            "idVerifier": "server",
+            "w0": "bb8e1bbcf3c48f62c08db243652ae55d3e5586053fca77102994f23ad95491b3",
+            "w1": "7e945f34d78785b8a3ef44d0df5a1a97d6b3b460409a345ca7830387a74b1dba",
+            "x": "d1232c8e8693d02368976c174e2088851b8365d0d79a9eee709c6a05a2fad539",
+            "shareV": "04c0f65da0d11927bdf5d560c69e1d7d939a05b0e88291887d679fcadea75810fb5cc1ca7494db39e82ff2f50665255d76173e09986ab46742c798a9a68437b048",
+            "note": "NOTE: the Windows test passes id_prover=client, id_verifier=server; the real camera flow uses EMPTY ids. Test both."
+          },
+          "expected": {
+            "shareP": "04ef3bd051bf78a2234ec0df197f7828060fe9856503579bb1733009042c15c0c1de127727f418b5966afadfdd95a6e4591d171056b333dab97a79c7193e341727",
+            "Z": "04bbfce7dd7f277819c8da21544afb7964705569bdf12fb92aa388059408d50091a0c5f1d3127f56813b5337f9e4e67e2ca633117a4fbd559946ab474356c41839",
+            "V": "0458bf27c6bca011c9ce1930e8984a797a3419797b936629a5a937cf2f11c8b9514b82b993da8a46e664f23db7c01edc87faa530db01c2ee405230b18997f16b68",
+            "K_main": "4c59e1ccf2cfb961aa31bd9434478a1089b56cd11542f53d3576fb6c2a438a29",
+            "K_confirmP": "871ae3f7b78445e34438fb284504240239031c39d80ac23eb5ab9be5ad6db58a",
+            "K_confirmV": "ccd53c7c1fa37b64a462b40db8be101cedcf838950162902054e644b400f1680",
+            "confirmP": "926cc713504b9b4d76c9162ded04b5493e89109f6d89462cd33adc46fda27527",
+            "confirmV": "9747bcc4f8fe9f63defee53ac9b07876d907d55047e6ff2def2e7529089d3e68",
+            "K_shared": "0c5f8ccd1413423a54f6c1fb26ff01534a87f893779c6e68666d772bfd91f3e7"
+          },
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:48"
+        },
+        {
+          "name": "pbkdf2_w0w1_raw_dk",
+          "input": {
+            "passcode": "0123abcd",
+            "salt_hex": "000102030405060708090a0b0c0d0e0f",
+            "iterations": 1000,
+            "len": 80
+          },
+          "expected": "6a2609b1bd0e81bb87a610193883a82cfcfbf9895fda4773531c635cd94d37707c5f53c7cf54ef1d8385682989155bfd78a368e90c4defa9b76edf27983ae65b3199554a0f499343c0dc9dea8e4d076e",
+          "note": "dk[0:40] and dk[40:80] each mod n; hex computed offline by the audit from the Windows test inputs (hashlib), test asserts only the formula",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:104"
+        },
+        {
+          "name": "context",
+          "input": {
+            "user_random": "0101010101010101010101010101010101010101010101010101010101010101",
+            "dev_random": "0202020202020202020202020202020202020202020202020202020202020202"
+          },
+          "expected": "c597cc9152238905dce4745e18c986b649f703a29e16e7894ff911464cff835f",
+          "note": "computed offline from the test inputs",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:111"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.tpap_extra_crypt",
+      "title": "Passcode shaping by register extra_crypt",
+      "facts": "passcode starts as md5hex(password) or SHA256U(password) (or SHA256U(LAT)); extra_crypt {type, params} reshapes it. type (case-insens.) 'password_shadow': passwd_id 1 -> md5-crypt($1$ prefix; unchanged if prefix not $1$), 2 -> sha1 hex lowercase, 3 -> unchanged (needs a user name, cameras send none), 5 -> sha256-crypt (Drepper; prefix '$5$[rounds=N$]salt$', salt<=16 chars, default 5000 rounds, rounds clamped 1000..999999999). 'password_authkey': out[i]=dictionary[(cred[i] xor tmpkey[i]) % len(dictionary)] over max(len), pad missing with 187. 'password_sha_with_salt': sha256hex((sha_name==0?'admin':'user') + utf8(b64decode(sha_salt)) + cred). Missing/malformed/unknown -> unchanged. C200 fw 1.5.7 uses shadow id 5 with SHA256U first.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:269",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:305",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:348",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:358",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:400"
+      ],
+      "spec_refs": [
+        "[spec:tpap.credentials.userpw]",
+        "[spec:tpap.extra_crypt]"
+      ],
+      "target": "lib/api/tpap_crypt.dart (new: md5crypt, sha256crypt, authkey)",
+      "tier": 1,
+      "tests": [
+        "test/unit/tpap_crypt_test.dart: sha256 crypt drepper vectors",
+        "test/unit/tpap_crypt_test.dart: md5 crypt vector and prefix check",
+        "test/unit/tpap_crypt_test.dart: apply extra crypt variants",
+        "test/unit/tpap_crypt_test.dart: authkey"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "sha256_crypt_a",
+          "input": {
+            "key": "Hello world!",
+            "prefix": "$5$saltstring"
+          },
+          "expected": "$5$saltstring$5B8vYYiY.CVt1RlTTf8KbXBH3hsxY/GNooZaBBGWEc5",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:181"
+        },
+        {
+          "name": "sha256_crypt_rounds",
+          "input": {
+            "key": "Hello world!",
+            "prefix": "$5$rounds=10000$saltstringsaltstring"
+          },
+          "expected": "$5$rounds=10000$saltstringsaltst$3xv.VbSHBb41AL9AvLeujZkZRBAwqFMz2.opqey6IcA",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:181"
+        },
+        {
+          "name": "md5_crypt",
+          "input": {
+            "key": "password",
+            "prefix": "$1$3azHgidD$"
+          },
+          "expected": "$1$3azHgidD$SrJPt7B.9rekpmwJwtON31",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:188"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.tpap_share_login",
+      "title": "TPAP pake_share and candidate order (bounded attempts)",
+      "facts": "pake_share: {sub_method:'pake_share', user_share:b64(shareP), user_confirm:b64(confirmP)}. Reply result: dev_confirm(b64, must equal confirmV), stok (required), start_seq (required int), expired (seconds, optional -> session expiry; re-login when reached). Candidate order per login (max 2 shares, each preceded by a FRESH pake_register): [LAT variant if a LAT exists] then password variants ['sha256','md5'] when register carried extra_crypt else ['md5','sha256']; no password => LAT only. After a success only the known-good variant is used, a refusal of it is retried once after 2 s (C200 refuses first share after a session ended). Two refusals => TapoAuthError (message mentions LAT use but never the token) and breaker. Empty password AND no LAT => error before any request. All secrets excluded from toString/logs.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:630",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:660",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:693",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:57",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:58"
+      ],
+      "spec_refs": [
+        "[spec:tpap.pake_share.request]",
+        "[spec:tpap.pake_share.reply]",
+        "[spec:tpap.relogin]",
+        "[spec:lat.tpap.passcode_candidates]"
+      ],
+      "target": "lib/api/tpap.dart (TpapAuthenticator)",
+      "tier": 2,
+      "tests": [
+        "test/unit/tpap_test.dart: wrong password raises auth error after exactly two attempts",
+        "test/unit/tpap_test.dart: locked camera stops immediately",
+        "test/unit/tpap_test.dart: dev confirm mismatch is auth error without retry",
+        "test/unit/tpap_test.dart: empty password never reaches the camera",
+        "test/unit/tpap_test.dart: c200 sha256 extra crypt uses one attempt",
+        "test/unit/tpap_test.dart: order follows register evidence",
+        "test/unit/tpap_test.dart: lat tried first",
+        "test/unit/tpap_test.dart: wrong lat falls back to best password variant",
+        "test/unit/tpap_test.dart: lat only without password logs in",
+        "test/unit/tpap_test.dart: relogin reuses known good variant"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.local.tpap_cipher",
+      "title": "TPAP /ds channel: AES-128-CCM framing",
+      "facts": "key = HKDF-SHA256(ikm=K_shared, salt='tp-kdf-salt-aes128-key', info='tp-kdf-info-aes128-key', L=32)[0:16]; nonceBase = HKDF-SHA256(K_shared, salt 'tp-kdf-salt-aes128-iv', info 'tp-kdf-info-aes128-iv', L=32)[0:12]. nonce(seq) = nonceBase[0:8] || u32_be(seq). AES-CCM tag 16 B, no AAD. Request body = u32_be(seq) || ciphertext || tag, POST /stok=<stok>/ds, Content-Type and Accept application/octet-stream; first seq = start_seq, every attempt burns a seq. Reply body: first 4 bytes seq (reply's own) then ct||tag; nonce from that seq. Plaintext JSON replies (starts with '{' and parses with error_code) mean refusal: -40401,-40418,-40420,-40421,-2402 => session invalid (re-login once); other codes => device error and drop session. HTTP 401 => session invalid; other non-200 => protocol error. Decrypt failure => session invalid. Only 'aes_128_ccm' supported (pointycastle CCMBlockCipher/AESEngine or package:cryptography AesCcm).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:416",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:444",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:580",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:102"
+      ],
+      "spec_refs": [
+        "[spec:tpap.session_cipher]",
+        "[spec:tpap.ds.framing]",
+        "[spec:tpap.ds.errors]"
+      ],
+      "target": "lib/api/tpap.dart (TpapCipher)",
+      "tier": 1,
+      "tests": [
+        "test/unit/tpap_test.dart: cipher golden vector and framing",
+        "test/unit/tpap_test.dart: nonce depends on seq and tamper detected",
+        "test/unit/tpap_test.dart: unknown encryption rejected",
+        "test/unit/tpap_test.dart: plaintext refusal detected"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "ccm_channel",
+          "input": {
+            "shared_key_hex": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+            "seq": "0x01020304",
+            "plain_ascii": "{\"method\":\"multipleRequest\",\"params\":{\"requests\":[]}}"
+          },
+          "expected": {
+            "aes_key_hex": "1f477a8c3d031511dcfd57aa01895887",
+            "nonce_base12_hex": "4240c38bb08a77faaae56105",
+            "sealed_body_hex": "01020304c0331c1c36a5df4ce0c68e5037aa4d73aa9e21f8948de12facf360f76840e308fd5655a5743a88ed00d870b74e27c752b26488afcc7d374dcd269cd7adbba8488279634617"
+          },
+          "note": "inputs from the Windows test; hex outputs computed offline by the audit with hashlib/hmac + cryptography AESCCM (same formula the test asserts)",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_tpap_crypto.py:132"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.lat_mode",
+      "title": "Local access token (LAT) mode",
+      "facts": "Some cameras reject the TP-Link ID password (-40401 on login) and accept only the cloud-issued localAccessToken from the IoT thing list. TPAP passcode = SHA256U(LAT) (UPPERCASE hex SHA-256 of the UTF-8 token) offered FIRST, then the password variants (within the 2-share cap). Secure v3: use raw LAT as the secret when device_confirm proves it (see local.v3_hashes). Legacy MD5 login always uses the password. :8800 media Digest secret is SHA256U(LAT) in encrypt_type 3 mode. LAT is refreshed on every sign-in/refresh: removed when the cloud returns none, kept when the fetch FAILS; a changed LAT rebuilds the control client (fresh breaker) and restarts the stream. Store per camera in secure storage. Never log or repr the token.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:60",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:620",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:432",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:509",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:337",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:411"
+      ],
+      "spec_refs": [
+        "[spec:lat.tpap.passcode_candidates]",
+        "[spec:lat.legacy_secure.login]",
+        "[spec:lat.media.digest]",
+        "[spec:lat.client.recommended_flow]",
+        "[spec:lat.app.cache]"
+      ],
+      "target": "lib/api/camera_control_client.dart + lib/state/secure_store.dart",
+      "tier": 2,
+      "tests": [
+        "test/unit/tpap_test.dart: lat passcode is sha256 upper of token",
+        "test/unit/camera_control_client_test.dart: v3 camera in lat mode",
+        "test/unit/camera_control_client_test.dart: v3 on password with lat given",
+        "test/unit/app_state_test.dart: refresh rotates and removes lat",
+        "test/unit/app_state_test.dart: fetch failure keeps cached lat",
+        "test/unit/secure_store_test.dart: lat never in toString"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "lat_passcode",
+          "input": "0123456789abcdef0123456789abcdef",
+          "expected": "3EB1BD439947EB762998E566CCC2E099C791118B2F40579CC4F7DA2B5061B7F9",
+          "note": "SHA256U of a made-up token, computed offline by the audit",
+          "source": "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/tpap.py:620"
+        }
+      ]
+    },
+    {
+      "id": "hc.local.media_digest_ref",
+      "title": "Reference: :8800 Digest secret and HKDF stream keys (media lane owns the code)",
+      "facts": "Digest secret = SHA256U(secret) when encrypt_type '3' else MD5U(secret); secret = LAT in LAT mode else password. Key-Exchange header with algorithm HKDF: ikm = nonce + ':' + transformedSecret (UTF-8), salt = Key-Exchange 'salt' as UTF-8, HKDF-SHA256 L=16, info 'stream_hkdf_aes_key' / 'stream_hkdf_hmac_key'; IV = per-part X-Nonce; X-Data-Hmac = b64 HMAC-SHA256(ciphertext). Listed here so the control lane hands the right secret to the media lane.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/vod/session.py:100",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/vod/session.py:218"
+      ],
+      "spec_refs": [
+        "[spec:lat.media.digest]",
+        "[spec:stream.local8800.encryption.hkdf]"
+      ],
+      "target": "lib/api/local_media.dart (media lane)",
+      "tier": 1,
+      "tests": [
+        "test/unit/local_media_test.dart: hkdf keys match reference derivation"
+      ],
+      "priority": "P1",
+      "vectors": [
+        {
+          "name": "hkdf_stream_keys",
+          "input": {
+            "nonce": "0123456789abcdef0123456789abcdef",
+            "salt": "fedcba9876543210fedcba9876543210",
+            "secret": "SHA256U('local-access-token')=4E5B2C20C1645A4EEDA8BD59251974653FFF883CA5480C9A54FBF87A263BD2C2"
+          },
+          "expected": {
+            "aes_key_hex": "0a6e6cb5d694ce1b2f081fb2c3b88d96",
+            "hmac_key_hex": "941348d22b7ba9eaa114b393798ecade"
+          },
+          "note": "test asserts the formula; hex computed offline by the audit",
+          "source": "refs/Tapo-Camera-Windows/tests/phase2/test_media_hkdf.py:37"
+        }
+      ]
+    },
+    {
+      "id": "hc.dto.envelope",
+      "title": "multipleRequest envelope and item normalisation",
+      "facts": "Every command is {method, params}; batches are {\"method\":\"multipleRequest\",\"params\":{\"requests\":[...]}} (order kept; empty list allowed locally, cloud sends nothing for an empty batch). Reply result.responses[] items {method, result:{...}, error_code:int|numeric string}; item normalised to {method:String?, result:Map (non-map -> {}), error_code:int}. Top-level error_code!=0 => device error 'multipleRequest'. Item error_code != 0 => device error(code, method). Numbers are string-encoded by the camera: accept int or integer string; reject bool. Parsers must throw a protocol error (never cast errors) on unusable data.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:106",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:122",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:532"
+      ],
+      "spec_refs": [
+        "[spec:envelope.request]",
+        "[spec:envelope.multiple_request]",
+        "[spec:envelope.multiple_response]"
+      ],
+      "target": "lib/api/camera_dtos.dart (new)",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_dtos_test.dart: multiple request matches spec",
+        "test/unit/camera_dtos_test.dart: multiple request preserves order and empty",
+        "test/unit/camera_dtos_test.dart: normalize item error code string",
+        "test/unit/camera_dtos_test.dart: parsers never throw non protocol errors"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "multiple_request_wire",
+          "input": "[getDeviceInfo]",
+          "expected": "{\"method\":\"multipleRequest\",\"params\":{\"requests\":[{\"method\":\"getDeviceInfo\",\"params\":{\"device_info\":{\"name\":[\"basic_info\"]}}}]}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/_core_helpers.py:36 (inner_request_json of the v3 golden)"
+        }
+      ]
+    },
+    {
+      "id": "hc.dto.device_info",
+      "title": "getDeviceInfo / getAppComponentList",
+      "facts": "getDeviceInfo params {device_info:{name:['basic_info']}}; parse result.device_info.basic_info: device_model (required non-empty), device_alias, sw_version, hw_version, mac, dev_id, keep raw map. getAppComponentList params {app_component:{name:['app_component_list']}}; result.app_component.app_component_list[] {name, version(int|string)} -> map name->int. Component list gates features per model (e.g. ptz/lens_mask/siren): a getter the camera does not support answers non-zero item error_code and the UI shows the default.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:112",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:117",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:128"
+      ],
+      "spec_refs": [
+        "[spec:control.device_info.get]",
+        "[spec:control.device_info.basic_info_fields]",
+        "[spec:capability.component_list]"
+      ],
+      "target": "lib/api/camera_dtos.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_dtos_test.dart: device info request matches spec",
+        "test/unit/camera_dtos_test.dart: parse device info",
+        "test/unit/camera_dtos_test.dart: parse device info unusable",
+        "test/unit/camera_dtos_test.dart: parse component list string versions"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.dto.privacy",
+      "title": "Privacy mode (lens mask)",
+      "facts": "get: {method:'getLensMaskConfig', params:{lens_mask:{name:['lens_mask_info']}}}; parse result.lens_mask.lens_mask_info.enabled 'on'|'off' (anything else = protocol error). set: {method:'setLensMaskConfig', params:{lens_mask:{lens_mask_info:{enabled:'on'|'off'}}}}. Baseline TV currently uses privacy through cloud passthrough already (getPrivacyMode/setPrivacyMode): reuse DTO builders so LAN and cloud share the payload. Cloud error -64324 means privacy is on (PTZ blocked).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:213",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:218",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:223"
+      ],
+      "spec_refs": [
+        "[spec:control.privacy.get]",
+        "[spec:control.privacy.set]"
+      ],
+      "target": "lib/api/camera_dtos.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_dtos_test.dart: get privacy request",
+        "test/unit/camera_dtos_test.dart: set privacy off request",
+        "test/unit/camera_dtos_test.dart: parse privacy on off",
+        "test/unit/camera_dtos_test.dart: parse privacy unusable"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "set_privacy_off",
+          "input": false,
+          "expected": "{\"method\":\"setLensMaskConfig\",\"params\":{\"lens_mask\":{\"lens_mask_info\":{\"enabled\":\"off\"}}}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_dtos.py:118"
+        }
+      ]
+    },
+    {
+      "id": "hc.dto.ptz",
+      "title": "PTZ: motorMove, singalMove (sic), stopMove, presets",
+      "facts": "move: {method:'motorMove', params:{motor:{move:{x_coord:'<int as string>', y_coord:'<int as string>'}}}} (signed integer strings, dx>0 = pan right). step: {method:'singalMove' (typo is the real name), params:{motor:{movestep:{direction:'0'|'90'|'180'|'270'}}}}, other directions rejected. stop: {method:'stopMove', params:{motor:{stop:'null'}}} (string 'null'). presets: getPresetConfig {preset:{name:['preset']}} -> parallel arrays result.preset.preset {id,name,position_pan,position_tilt,read_only}; goto {method:'motorMoveToPreset', params:{preset:{goto_preset:{id:'<str>'}}}}; add {method:'addMotorPostion' (sic), params:{preset:{set_preset:{name, save_ptz:'1'}}}}; delete {method:'deletePreset', params:{preset:{remove_preset:{id:['<str>']}}}}. PTZ errors: -64303 motor busy, -64304 limit reached, -64324 privacy on, -64336 privacy zone.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:144",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:149",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:156",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:162",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:197"
+      ],
+      "spec_refs": [
+        "[spec:control.ptz.move]",
+        "[spec:control.ptz.move_step]",
+        "[spec:control.ptz.stop]",
+        "[spec:control.preset.list]",
+        "[spec:control.preset.goto]",
+        "[spec:error_code.ptz]"
+      ],
+      "target": "lib/api/camera_dtos.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_dtos_test.dart: motor move coords are signed int strings",
+        "test/unit/camera_dtos_test.dart: motor step all directions",
+        "test/unit/camera_dtos_test.dart: motor step invalid direction",
+        "test/unit/camera_dtos_test.dart: stop move request",
+        "test/unit/camera_dtos_test.dart: presets parse parallel arrays",
+        "test/unit/camera_dtos_test.dart: goto and delete preset ids are strings"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "motor_move",
+          "input": {
+            "x": -5,
+            "y": 7
+          },
+          "expected": "{\"method\":\"motorMove\",\"params\":{\"motor\":{\"move\":{\"x_coord\":\"-5\",\"y_coord\":\"7\"}}}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_dtos.py:100"
+        },
+        {
+          "name": "motor_step_90",
+          "input": 90,
+          "expected": "{\"method\":\"singalMove\",\"params\":{\"motor\":{\"movestep\":{\"direction\":\"90\"}}}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_dtos.py:106"
+        }
+      ]
+    },
+    {
+      "id": "hc.dto.night_vision",
+      "title": "Night vision / day-night (IR) mode",
+      "facts": "Windows app uses the day/night config: get {method:'getDayNightModeConfig', params:{image:{name:'common'}}} (note name is a STRING here), parse result.image.common.inf_type in {'auto','on','off'}; set {method:'setDayNightModeConfig', params:{image:{common:{inf_type:'auto'|'on'|'off'}}}}. The spec also lists newer getNightVisionModeConfig/setNightVisionModeConfig (enum night_vision_mode) for models that expose a different component: pick by component list. DayNightMode values: auto, on, off.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:228",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:233",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:242"
+      ],
+      "spec_refs": [
+        "[spec:control.day_night.get]",
+        "[spec:control.day_night.set]",
+        "[spec:enum.inf_type]",
+        "[spec:control.night_vision_mode.get]",
+        "[spec:capability.night_vision]"
+      ],
+      "target": "lib/api/camera_dtos.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_dtos_test.dart: get day night request",
+        "test/unit/camera_dtos_test.dart: set day night values",
+        "test/unit/camera_dtos_test.dart: parse day night unknown value"
+      ],
+      "priority": "P1",
+      "vectors": [
+        {
+          "name": "set_day_night_auto",
+          "input": "auto",
+          "expected": "{\"method\":\"setDayNightModeConfig\",\"params\":{\"image\":{\"common\":{\"inf_type\":\"auto\"}}}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_dtos.py:123"
+        }
+      ]
+    },
+    {
+      "id": "hc.dto.led_siren_motion",
+      "title": "Status LED, manual siren/alarm, motion detection",
+      "facts": "LED get {getLedStatus {led:{name:['config']}}} -> result.led.config.enabled on/off; set {setLedStatus {led:{config:{enabled}}}}. Siren/alarm: {method:'doManualAlarm', params:{msg_alarm:{manual_alarm:{action:'start'|'stop'}}}} (the Windows app keeps its own alarm flag; no getter). Motion: get {getDetectionConfig {motion_detection:{name:['motion_det'],table:['region_info']}}} -> result.motion_detection.motion_det {enabled on/off, digital_sensitivity int|string optional}; set {setDetectionConfig {motion_detection:{motion_det:{enabled, digital_sensitivity?:'20'|'60'|'80'}}}} (other levels rejected). Reboot {rebootDevice {system:{reboot:{}}}} is out of scope for the TV (never move/reboot real cameras in tests).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:247",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:262",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:268",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:281"
+      ],
+      "spec_refs": [
+        "[spec:control.led.get]",
+        "[spec:control.led.set]",
+        "[spec:control.alarm.manual]",
+        "[spec:control.motion_detection.get]",
+        "[spec:control.motion_detection.set]"
+      ],
+      "target": "lib/api/camera_dtos.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_dtos_test.dart: set led on",
+        "test/unit/camera_dtos_test.dart: manual alarm stop",
+        "test/unit/camera_dtos_test.dart: set motion detection levels",
+        "test/unit/camera_dtos_test.dart: set motion detection invalid sensitivity",
+        "test/unit/camera_dtos_test.dart: parse motion detection without sensitivity"
+      ],
+      "priority": "P1",
+      "vectors": [
+        {
+          "name": "manual_alarm_stop",
+          "input": false,
+          "expected": "{\"method\":\"doManualAlarm\",\"params\":{\"msg_alarm\":{\"manual_alarm\":{\"action\":\"stop\"}}}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_dtos.py:133"
+        },
+        {
+          "name": "set_led_on",
+          "input": true,
+          "expected": "{\"method\":\"setLedStatus\",\"params\":{\"led\":{\"config\":{\"enabled\":\"on\"}}}}",
+          "source": "refs/Tapo-Camera-Windows/tests/unit/test_dtos.py:129"
+        }
+      ]
+    },
+    {
+      "id": "hc.dto.rename",
+      "title": "Rename (setDeviceAlias) and name rules",
+      "facts": "Request {method:'setDeviceAlias', params:{system:{sys:{dev_alias:<name>}}}}; sent through the SAME route as other commands (LAN client or cloud passthrough); no separate cloud call, the cloud picks the alias up from the camera. Validation before sending: NFC-normalise, trim, non-empty, no control chars (category Cc), <= 32 UTF-8 BYTES (not chars). Camera refusal -63103 (alias format) or -40210 => message 'refused' with code. Only owned cloud cameras (role==0) rename on the camera; shared cameras (role!=0) and manual cameras keep a local display name. After a rename keep pending_name (wins over cloud alias until the cloud alias matches or 24 h). Dart: NFC needs a package (e.g. unorm_dart) or restrict to a no-op check.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:370",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_names.py:56",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_names.py:78",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_names.py:84",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:549"
+      ],
+      "spec_refs": [
+        "[spec:rename.request]",
+        "[spec:rename.flow]",
+        "[spec:rename.validation]",
+        "[spec:rename.shared_permission]"
+      ],
+      "target": "lib/api/camera_dtos.dart + lib/state/camera_names.dart (new)",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_names_test.dart: set device alias request exact",
+        "test/unit/camera_names_test.dart: limit is 32 utf8 bytes",
+        "test/unit/camera_names_test.dart: control characters refused",
+        "test/unit/camera_names_test.dart: decomposed vietnamese composed before counting",
+        "test/unit/camera_names_test.dart: only owned cloud cameras rename on camera",
+        "test/unit/camera_names_test.dart: pending rename wins until cloud matches",
+        "test/unit/camera_names_test.dart: pending rename expires after 24 hours"
+      ],
+      "priority": "P1",
+      "vectors": [
+        {
+          "name": "set_device_alias",
+          "input": "Cổng trước",
+          "expected": "{\"method\":\"setDeviceAlias\",\"params\":{\"system\":{\"sys\":{\"dev_alias\":\"Cổng trước\"}}}}",
+          "source": "refs/Tapo-Camera-Windows/tests/phase7/test_names.py:18"
+        },
+        {
+          "name": "name_limit",
+          "input": [
+            "CổngCổngCổngCổng",
+            "ổổổổổổổổổổổ",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+          ],
+          "expected": [
+            "valid (24 bytes)",
+            "invalid (33 bytes)",
+            "invalid (33 bytes)"
+          ],
+          "source": "refs/Tapo-Camera-Windows/tests/phase7/test_names.py:54"
+        }
+      ]
+    },
+    {
+      "id": "hc.dto.recordings_refs",
+      "title": "Clip search request shapes (SD playback lane)",
+      "facts": "searchDateWithVideo {playback:{search_year_utility:{channel:[0], start_date:'yyyyMMdd', end_date}}}; searchVideoWithUTC {playback:{search_video_with_utc:{id:1 | player_id:<32hex>, channel:0, start_time, end_time, start_index, end_index}}} page size 100, repeat while result.playback.to_be_continued != 0. Error -71103 => retry the page ONCE with the other form (id <-> player_id) and remember the working form. Out of the live-view MVP, listed for the playback lane.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:303",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/dtos.py:327",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:131",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/client.py:242"
+      ],
+      "spec_refs": [
+        "[spec:vod.search.days]",
+        "[spec:vod.search.day_clips_utc]"
+      ],
+      "target": "lib/api/camera_dtos.dart",
+      "tier": 1,
+      "tests": [
+        "test/unit/camera_dtos_test.dart: search day clips matches spec legacy utc shape",
+        "test/unit/camera_dtos_test.dart: clip search falls back to player id on -71103"
+      ],
+      "priority": "P2"
+    },
+    {
+      "id": "hc.passthrough.request",
+      "title": "Cloud passthrough request (services-sync)",
+      "facts": "POST {thing.appServerUrlV2 || appServerUrl}/v1/things/{thingName percent-encoded as ONE path segment}/services-sync with IoT headers (not signed), body {\"serviceId\":\"passthrough\",\"inputParams\":{\"requestData\":{\"method\":\"multipleRequest\",\"params\":{\"requests\":[...]}}}}. 30 s timeout. url must be http(s) without query/fragment; refuse http when the account API is https. Baseline posts to a discovered IoT server 'v2' (fallback v1) instead of the per-thing URL and always /v2: Windows evidence uses /v1 with the thing's own regional URL; keep the thing URL as primary (open question on v2).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/passthrough.py:59",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/passthrough.py:124",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/passthrough.py:43"
+      ],
+      "spec_refs": [
+        "[spec:remote.control.iot_passthrough.request]"
+      ],
+      "target": "lib/api/cloud_passthrough.dart (new; replaces TapoCloud.servicesSync)",
+      "tier": 2,
+      "tests": [
+        "test/unit/cloud_passthrough_test.dart: envelope headers and items",
+        "test/unit/cloud_passthrough_test.dart: thing name is path quoted",
+        "test/unit/cloud_passthrough_test.dart: bad thing url refused",
+        "test/unit/cloud_passthrough_test.dart: empty batch sends nothing",
+        "test/unit/cloud_passthrough_test.dart: thing url falls back to app server url"
+      ],
+      "priority": "P0",
+      "vectors": [
+        {
+          "name": "services_sync_body",
+          "input": "[getDeviceInfo, getLedStatus]",
+          "expected": {
+            "path": "/v1/things/<deviceId>/services-sync",
+            "authorization": "ut|<token>",
+            "app-cid": "app:TP-Link_Tapo_Android:<terminalUUID>",
+            "body_keys": [
+              "serviceId",
+              "inputParams.requestData.method",
+              "inputParams.requestData.params.requests"
+            ]
+          },
+          "source": "refs/Tapo-Camera-Windows/tests/phase4/test_passthrough.py:46"
+        }
+      ]
+    },
+    {
+      "id": "hc.passthrough.response_errors",
+      "title": "Cloud passthrough reply and error mapping",
+      "facts": "Reply {outputParams:{responseData:{error_code, result:{responses:[...]}}}}; some paths put responseData directly in outputParams, or nest under result.outputParams: accept all. cloud code = first non-zero of code|errorCode|error_code. HTTP 401 or code in {-20651,-20652,-20675} => refresh token once (single-flight across concurrent callers; skip if token already changed) and retry once, then 'session expired'. -20571 => 'Camera is offline'; -20002, 12202 or HTTP 408 => 'Camera did not respond'; HTTP 429 => 'cloud busy'; -20580 => not linked to this account; other => TP-Link cloud error <code>. responseData.error_code!=0 => device error ('multipleRequest') except offline/timeout codes. responses[] normalised like the LAN items (per-item errors stay in the items).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/passthrough.py:91",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/passthrough.py:144",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/cloud/passthrough.py:155"
+      ],
+      "spec_refs": [
+        "[spec:remote.control.iot_passthrough.response]",
+        "[spec:remote.control.rate_limits]"
+      ],
+      "target": "lib/api/cloud_passthrough.dart",
+      "tier": 2,
+      "tests": [
+        "test/unit/cloud_passthrough_test.dart: direct output params shape",
+        "test/unit/cloud_passthrough_test.dart: per item errors are kept",
+        "test/unit/cloud_passthrough_test.dart: cloud errors have user messages",
+        "test/unit/cloud_passthrough_test.dart: expired token relogs in once",
+        "test/unit/cloud_passthrough_test.dart: token rejected twice gives up",
+        "test/unit/cloud_passthrough_test.dart: malformed reply is protocol error"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.routing.local_vs_cloud",
+      "title": "Per-camera routing: local, cloud passthrough, relay",
+      "facts": "cloud_routed = camera is a cloud camera AND (role != 0 OR not (lan_found AND host non-empty)). Cloud-routed: control via passthrough, live via relay (cloudType 2), playback via relay VOD, motion events polled at most every 30 s. Else (owner, found on LAN): local HTTPS :443 control, :8800 live/playback. No signed-in cloud for a remote camera => error NETWORK_ONLY; offline cloud camera => 'Camera is offline'; shared without cloud => SHARED_CLOUD_ONLY. Optional camera account => ONVIF :2020 / RTSP :554 (not for MVP). Re-run TDP + thing list on refresh; a camera that moves LAN<->remote switches route on next call (rebuild clients).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:390",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:386",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:323",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/remote.py:59",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:415"
+      ],
+      "spec_refs": [
+        "[spec:remote.control.transport_selection]",
+        "[spec:lan.live_view_selection]"
+      ],
+      "target": "lib/api/camera_router.dart (new)",
+      "tier": 3,
+      "tests": [
+        "test/unit/camera_router_test.dart: owner on lan is local",
+        "test/unit/camera_router_test.dart: owner not found on lan is cloud",
+        "test/unit/camera_router_test.dart: shared on lan is cloud",
+        "test/unit/camera_router_test.dart: manual camera never cloud",
+        "test/unit/camera_router_test.dart: rebuild client when lan_found flips"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.routing.shared_rule",
+      "title": "Shared-camera rule (never log in locally)",
+      "facts": "A camera with thing role != 0 (shared to this account) is ALWAYS cloud-routed even when found on the LAN: the user's own TP-Link ID password is not that camera's credential and every local attempt burns lockout counters. role comes from the IoT thing record (fallback: device-list role), share_type string kept. Controls for shared cameras go through passthrough with the user's own token (works); rename is local-only display name; which commands a shared user may send is unverified on hardware.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:390",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/remote.py:59",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:552",
+        "refs/Tapo-Camera-Windows/tests/phase4/test_remote_control.py:141"
+      ],
+      "spec_refs": [
+        "[spec:remote.shared.behaviour]",
+        "[spec:remote.shared.device_flags]",
+        "[spec:rename.shared_permission]"
+      ],
+      "target": "lib/api/camera_router.dart + lib/state/app_state.dart (Camera.role)",
+      "tier": 3,
+      "tests": [
+        "test/unit/camera_router_test.dart: role 1 never builds local client",
+        "test/unit/camera_router_test.dart: role from thing record wins over device list"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.routing.status_batch",
+      "title": "Batched status read (cloud) and alarm polling",
+      "facts": "Remote status = ONE passthrough multipleRequest with [getLensMaskConfig, getDayNightModeConfig, getLedStatus, getDetectionConfig]; an item with non-zero error_code (unsupported model) yields its default (false / auto). LAN status reads each separately with the same defaults. Remote/shared cameras: poll getLastAlarmInfo at most every 30 s (each poll is a cloud call).",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:512",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/camera_service.py:924"
+      ],
+      "spec_refs": [
+        "[spec:remote.control.rate_limits]",
+        "[spec:control.system.last_alarm_info]"
+      ],
+      "target": "lib/state/app_state.dart (refreshCameraState)",
+      "tier": 3,
+      "tests": [
+        "test/unit/camera_router_test.dart: remote status single call with defaults"
+      ],
+      "priority": "P1"
+    },
+    {
+      "id": "hc.storage.secure",
+      "title": "Secure storage and what persists",
+      "facts": "Windows (DPAPI vault): TP-Link ID email+password ONLY when 'keep me signed in'; per-camera local access token (user 'admin'); settings: account (non-secret: email, nickname, accountId, region_url), terminal_uuid, TLS pins {host:port: sha256 DER}. Cloud token lives in memory only. Android TV: flutter_secure_storage (Keystore-backed EncryptedSharedPreferences) for token, password (if kept), LATs, terminal uuid; pins and non-secret settings may stay in shared_preferences. Baseline stores the session token + refreshToken in plain SharedPreferences (tapo_cloud/app_state.dart:252): migrate and wipe the old key. Sign-out deletes token, password, LATs, pins of cloud cameras; keep terminal uuid. Secrets never in logs/toString/crash reports; adb backup disabled for the secure store.",
+      "source": [
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/auth/vault.py:20",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:9",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/services/account.py:28",
+        "refs/Tapo-Camera-Windows/src/tapo_desktop/core/control_client/transport.py:40"
+      ],
+      "spec_refs": [
+        "[spec:lat.app.cache]",
+        "[spec:cloud.terminal_uuid]"
+      ],
+      "target": "lib/state/secure_store.dart (new) + pubspec flutter_secure_storage + android allowBackup=false",
+      "tier": 3,
+      "tests": [
+        "test/unit/secure_store_test.dart: roundtrip with fake backend",
+        "test/unit/secure_store_test.dart: sign out wipes token password lat",
+        "test/unit/secure_store_test.dart: legacy shared_preferences session migrated and removed",
+        "test/unit/secure_store_test.dart: to_string never shows secrets"
+      ],
+      "priority": "P0"
+    },
+    {
+      "id": "hc.baseline.gap_list",
+      "title": "Gaps of the TV baseline versus the Windows protocol",
+      "facts": "tapo_cloud.dart/app_state.dart today: (1) bootstrap n-wap-gw.tplinkcloud.com and key appServerUrl instead of getAccountStatusAndUrl -> appServerUrlV2; (2) no common query params (appName, appVer, netType, termID, ospf, brand, locale); (3) appVersion 3.21.114 vs 3.22.806 used on real hardware; (4) device list requests only SMART.IPCAMERA (no doorbell); (5) IoT server id 'nbu.iot-app-server.app' (Windows: '-v2') and services-sync built from the discovered IoT server, not the thing's appServerUrlV2; (6) no IoT thing list: no role, status or localAccessToken; (7) no captchaLogin / password refresh, token in plain SharedPreferences; (8) no local control at all (TDP, v3, TPAP, LAT, pins); (9) only privacy and PTZ move are implemented; (10) every control goes through the cloud. User-Agent okhttp/3.12.13 vs app UA for IoT calls.",
+      "source": [
+        "lib/api/tapo_cloud.dart:19",
+        "lib/api/tapo_cloud.dart:244",
+        "lib/api/tapo_cloud.dart:361",
+        "lib/api/tapo_cloud.dart:402",
+        "lib/state/app_state.dart:252"
+      ],
+      "spec_refs": [
+        "[spec:cloud.base_urls]"
+      ],
+      "target": "lib/api/tapo_cloud.dart, lib/state/app_state.dart",
+      "tier": 3,
+      "tests": [
+        "test/unit/tapo_cloud_test.dart: regression of the above once fixed"
+      ],
+      "priority": "P0"
+    }
+  ],
+  "decisions": [
+    "Tier legend: 1 = pure Dart unit (crypto, DTOs, parsers, golden vectors, no I/O); 2 = protocol client against a fake transport/server in test; 3 = app-state/routing/storage with fakes; 4 = Android native (Kotlin) or UI. Priority P0 = needed for the local+cloud live-view MVP (sign-in -> list -> local or relay live view -> privacy/PTZ).",
+    "Windows behaviour is the reference where it differs from the TV baseline (appServerUrlV2, getAccountStatusAndUrl, -v2 IoT service id, common query params, thing-list roles). Baseline Topo code is kept only where it equals Windows.",
+    "Local control stack order of implementation: local_crypto (v3) -> camera_transport (TOFU pin) -> camera_control_client (login state machine + breaker) -> tpap (SPAKE2+ + CCM) -> LAT wiring. Live view on current C200-class firmware needs TPAP, so tpap is P0, not optional.",
+    "The TP-Link ID password cannot be dropped: the camera's local passcode (v3 secret, TPAP md5/sha256 candidates) and captchaLogin refresh need it. PORTING_BRIEF says 'never store the cloud password' -> proposal: store it only in Keystore-backed flutter_secure_storage, only after an explicit 'Keep me signed in' choice (default on for TV remote use, easy wipe on sign-out); LAT-only cameras and cloud-routed cameras work without it after sign-in (token + LAT). Needs the owner's approval.",
+    "SPAKE2+ and RSA-OAEP need a Dart crypto library (pointycastle or package:cryptography) because package:crypto has only hashes/HMAC. Run PBKDF2 (>=10k iterations x 80 B), RSA-2048 keygen and P-256 scalar mults in a background isolate; port the Windows BigInt affine arithmetic only as a fallback. Validate with the RFC 9383 vector before wiring to a camera.",
+    "Never test against real cameras. All local flows are tested against a Dart fake camera (port of tests/fixtures/mock_tapo_server: dispatcher, tpap_server, secure v3, legacy) and a fake cloud (port of tests/fixtures/mock_cloud.py). Golden vectors in this file are the byte-level gate.",
+    "Cloud-routed cameras (remote or shared) use the same DTO builders and the same ControlApi interface as LAN, with RemoteControlClient/CloudPassthrough as the transport (same pattern as Windows ControlApi).",
+    "Online state: IoT thing status==1 OR found by TDP; role from the thing record decides shared (role != 0).",
+    "Vector provenance: most vectors are copied from specs or tests in the Windows repo. Entries whose note says 'computed offline by the audit' were derived with hashlib/hmac/cryptography from the Windows test INPUTS (the tests assert the formula, not a literal); re-verify them against the Windows implementation when writing the Dart test.",
+    "TDP discovery uses dart:io RawDatagramSocket (broadcast) plus a MethodChannel for interface netmasks and a WifiManager MulticastLock when needed; no Kotlin crypto is required, all crypto stays in Dart.",
+    "Passwords, tokens, LATs, stok, keys: never in logs, toString, exceptions or test snapshots. Fake values only (test_password, 192.168.1.x)."
+  ],
+  "open_questions": [
+    "Does flutter_secure_storage (Keystore) satisfy the 'never store the cloud password' rule when the user opts in? Without the password captchaLogin refresh, v3/TPAP password variants and md5/sha256 passcodes cannot work, so only LAT/cloud-routed cameras would work after token expiry.",
+    "services-sync version: Windows uses {thing appServerUrlV2}/v1/things/{id}/services-sync (proven on owned and shared C510W); baseline tries v2 first and falls back to v1 on 404/405/501. Is /v2 ever needed? Verify with the owner before dropping the fallback.",
+    "Does a TV box receive unicast TDP replies without a MulticastLock, and can dart:io read interface netmasks? (needs a device test, no cameras needed beyond the owner's LAN).",
+    "Dart TPAP performance: PBKDF2 plus affine BigInt/pointycastle EC math on low-end TV SoCs; measure. Fallback: native Kotlin (BouncyCastle/JCA) behind a MethodChannel for SPAKE2+ only.",
+    "NFC normalisation for camera names (Vietnamese diacritics) needs a package or Kotlin java.text.Normalizer via channel.",
+    "Night vision: Windows uses getDayNightModeConfig only; the spec also has getNightVisionModeConfig for newer models. Which component name gates it (see capability.night_vision)? Not verified on hardware.",
+    "Which commands a shared user may send through passthrough is unverified (Windows AGENTS section 8); rename for shared cameras stays local.",
+    "App version/UA: baseline reports 3.21.114, Windows 3.22.806 (proven on hardware). Confirm the cloud accepts the newer version string from a TV terminalName/'Android 14' platform.",
+    "Terminal name for MFA 'trusted devices' list: Windows 'Tapo Desktop (Windows PC)', baseline 'Topo TV - Android TV'. Keep a TV-specific name; unknown whether the server validates it (spec marks it unresolved).",
+    "Session expiry for TPAP uses result.expired seconds; v3 sessions have no stated expiry: confirm -40401 handling on long-running TV live sessions (reconnect strategy shared with the media lane).",
+    "Exact Windows test line for a v3 server-side nonce/device_confirm fixture sits in tests/fixtures/mock_tapo_server/camera.py (fixed_nonce, fixed_start_seq); port that fixture rather than inventing a new one."
+  ]
+}
