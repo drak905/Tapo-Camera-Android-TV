@@ -584,18 +584,21 @@ class _Attempt {
   Future<void> _cleanup() async {
     _heartbeat?.cancel();
     _heartbeat = null;
-    final sub = _sub;
-    _sub = null;
-    unawaited(sub?.cancel());
     final s = session;
-    if (s == null) return;
-    final polite = _interrupt != null && s.sessionId != null;
+    final polite = s != null && _interrupt != null && s.sessionId != null;
+    // Windows order: stop request, linger, close. Keep reading until the stop
+    // is out: cancelling a (TLS) socket's input first may drop the stop.
     if (polite) {
       try {
         await s.sendJson(stopRequestJson(s.nextSeq()));
+        await s.flush();
         await Future<void>.delayed(owner.stopLinger);
       } catch (_) {}
     }
+    final sub = _sub;
+    _sub = null;
+    unawaited(sub?.cancel());
+    if (s == null) return;
     unawaited(s.close().catchError((Object _) {}));
   }
 }
