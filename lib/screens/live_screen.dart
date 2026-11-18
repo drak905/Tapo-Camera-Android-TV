@@ -7,10 +7,16 @@ import '../api/tapo_cloud.dart';
 import '../main.dart';
 import '../player/live_player.dart';
 import '../state/app_state.dart';
+import '../state/camera_actions.dart';
+import '../state/camera_actions_impl.dart' show LivePlayback;
+import '../state/camera_view_model.dart';
 import '../ui/guide.dart';
+import '../ui/route_badge.dart';
 import '../ui/theme.dart';
 import '../ui/tv.dart';
 import 'home_screen.dart' show digitIndex;
+import 'rename_dialog.dart';
+import 'vod_timeline_screen.dart';
 
 final _nextKeys = {
   LogicalKeyboardKey.channelUp,
@@ -79,7 +85,7 @@ class _LiveScreenState extends State<LiveScreen> {
 
   AppState get _app => AppScope.read(context);
   Camera? get _camera {
-    final cams = _app.cameras;
+    final cams = _app.sortedCameras;
     if (cams.isEmpty) return null;
     return cams[_index.clamp(0, cams.length - 1)];
   }
@@ -118,7 +124,7 @@ class _LiveScreenState extends State<LiveScreen> {
   }
 
   void _switchCamera(int delta, {int? absolute}) {
-    final count = _app.cameras.length;
+    final count = _app.sortedCameras.length;
     if (count == 0) return;
     final next = absolute ?? (_index + delta) % count;
     if (next < 0 || next >= count) return;
@@ -192,6 +198,83 @@ class _LiveScreenState extends State<LiveScreen> {
     } finally {
       if (mounted) setState(() => _privacyBusy = false);
     }
+  }
+
+  static DayNightMode _nextDayNight(DayNightMode? mode) => switch (mode) {
+        DayNightMode.auto || null => DayNightMode.on,
+        DayNightMode.on => DayNightMode.off,
+        DayNightMode.off => DayNightMode.auto,
+      };
+
+  Future<void> _cycleNightVision() async {
+    final camera = _camera;
+    if (camera == null) return;
+    try {
+      await _app.setDayNight(camera, _nextDayNight(camera.dayNight));
+    } catch (e) {
+      if (mounted) showToast(context, e.toString(), error: true);
+    }
+  }
+
+  Future<void> _toggleSiren() async {
+    final camera = _camera;
+    if (camera == null) return;
+    final on = !(camera.alarm ?? false);
+    try {
+      await _app.setAlarm(camera, on);
+      if (mounted) showToast(context, on ? 'Siren is on' : 'Siren is off');
+    } catch (e) {
+      if (mounted) showToast(context, e.toString(), error: true);
+    }
+  }
+
+  Future<void> _rename() async {
+    final camera = _camera;
+    if (camera == null) return;
+    _hudTimer?.cancel();
+    final name = await showRenameDialog(context, currentName: camera.name, localOnly: camera.isShared);
+    if (!mounted) return;
+    _bumpHud();
+    if (name == null) return;
+    try {
+      await _app.renameCamera(camera, name);
+      if (mounted) showToast(context, 'Renamed to $name');
+    } catch (e) {
+      if (!mounted) return;
+      final refused = e is CameraActionException && e.code == -63103;
+      showToast(
+        context,
+        refused ? 'The camera refused this name. Use a shorter name with letters, numbers and spaces.' : e.toString(),
+        error: true,
+      );
+    }
+  }
+
+  void _openRecordings() {
+    final camera = _camera;
+    if (camera == null) return;
+    _hudTimer?.cancel();
+    Navigator.of(context)
+        .push(MaterialPageRoute<void>(
+          builder: (_) => VodTimelineScreen(camera: camera, videoBuilder: _playbackVideo),
+        ))
+        .whenComplete(() {
+      guideSection.value = GuideSection.live;
+      if (mounted) _bumpHud();
+    });
+  }
+
+  /// Video surface of an SD playback: the same native player, fed from the
+  /// loopback bridge under the playback's id.
+  Widget _playbackVideo(BuildContext context, PlaybackControl control) {
+    if (control is! LivePlayback) return const ColoredBox(color: TopoColors.media);
+    final app = AppScope.read(context);
+    return LiveVideo(
+      key: ValueKey('vod-${control.bridgeId}'),
+      app: app,
+      camera: Camera({'deviceId': control.bridgeId, 'alias': 'Recording'}),
+      queued: false,
+    );
   }
 
   KeyEventResult _onKey(FocusNode node, KeyEvent event) {
@@ -273,6 +356,9 @@ class _LiveScreenState extends State<LiveScreen> {
         body: Focus(
           focusNode: _rootFocus,
           autofocus: true,
+          // The root only receives keys: the arrows never jump to it from a
+          // control button.
+          skipTraversal: true,
           onKeyEvent: _onKey,
           child: Stack(
             fit: StackFit.expand,
@@ -301,7 +387,7 @@ class _LiveScreenState extends State<LiveScreen> {
                     child: _TopBar(
                       camera: camera,
                       index: _index,
-                      count: app.cameras.length,
+                      count: app.sortedCameras.length,
                       live: !privacy && _liveState == LiveState.playing,
                     ),
                   ),
@@ -324,7 +410,7 @@ class _LiveScreenState extends State<LiveScreen> {
                       child: _Controls(
                         camera: camera,
                         firstFocus: _firstControlFocus,
-                        hasMultiple: app.cameras.length > 1,
+                        hasMultiple: app.sortedCameras.length > 1,
                         privacyBusy: _privacyBusy,
                         step: app.ptzStep,
                         canPtz: canPtz,
@@ -336,6 +422,10 @@ class _LiveScreenState extends State<LiveScreen> {
                           app.setPtzStep(steps[(steps.indexOf(app.ptzStep) + 1) % steps.length]);
                         },
                         onReconnect: _reconnect,
+                        onNightVision: _cycleNightVision,
+                        onSiren: _toggleSiren,
+                        onRename: _rename,
+                        onRecordings: _openRecordings,
                         onGuide: () => showRemoteGuide(context, section: GuideSection.live),
                         onHide: _hideHud,
                       ),
@@ -352,7 +442,7 @@ class _LiveScreenState extends State<LiveScreen> {
                     child: AnimatedOpacity(
                       opacity: _showTitle ? 1 : 0.0,
                       duration: const Duration(milliseconds: 400),
-                      child: _HintChip(canPtz: canPtz, multiple: app.cameras.length > 1),
+                      child: _HintChip(canPtz: canPtz, multiple: app.sortedCameras.length > 1),
                     ),
                   ),
                 ),
@@ -410,6 +500,10 @@ class _TopBar extends StatelessWidget {
                 ),
                 const SizedBox(width: 12),
                 Text(camera.model, style: const TextStyle(color: Colors.white70, fontSize: 15)),
+                if (camera.view != null) ...[
+                  const SizedBox(width: 12),
+                  RouteBadge(route: camera.isShared ? CameraRoute.cloud : camera.route, online: camera.online),
+                ],
               ],
             ),
           ),
@@ -438,6 +532,10 @@ class _Controls extends StatelessWidget {
     required this.onPrivacy,
     required this.onStep,
     required this.onReconnect,
+    required this.onNightVision,
+    required this.onSiren,
+    required this.onRename,
+    required this.onRecordings,
     required this.onGuide,
     required this.onHide,
   });
@@ -449,12 +547,55 @@ class _Controls extends StatelessWidget {
   final int step;
   final bool canPtz;
   final VoidCallback onPrev, onNext, onPrivacy, onStep, onReconnect, onGuide, onHide;
+  final VoidCallback onNightVision, onSiren, onRename, onRecordings;
+
+  static String _dayNightLabel(DayNightMode? mode) => switch (mode) {
+        DayNightMode.on => 'Night vision: On',
+        DayNightMode.off => 'Night vision: Off',
+        _ => 'Night vision: Auto',
+      };
 
   @override
   Widget build(BuildContext context) {
     final privacy = camera.privacy == true;
+    final caps = camera.capabilities;
+    final buttons = <Widget>[
+      TvButton(
+        label: privacy ? 'Turn privacy off' : 'Turn privacy on',
+        icon: privacy ? Icons.visibility_off_rounded : Icons.visibility_rounded,
+        onMedia: true,
+        focusNode: firstFocus,
+        busy: privacyBusy || camera.privacy == null,
+        style: privacy ? TvButtonStyle.primary : TvButtonStyle.secondary,
+        onPressed: onPrivacy,
+      ),
+      if (caps.contains(CameraCapability.nightVision))
+        TvButton(label: _dayNightLabel(camera.dayNight), icon: Icons.nightlight_round, onMedia: true, onPressed: onNightVision),
+      if (caps.contains(CameraCapability.siren))
+        TvButton(
+          label: 'Siren',
+          icon: Icons.notifications_active_rounded,
+          onMedia: true,
+          style: camera.alarm == true ? TvButtonStyle.primary : TvButtonStyle.secondary,
+          onPressed: onSiren,
+        ),
+      if (camera.view != null) TvButton(label: 'Rename', icon: Icons.edit_rounded, onMedia: true, onPressed: onRename),
+      if (caps.contains(CameraCapability.sdCard))
+        TvButton(label: 'Recordings', icon: Icons.video_library_rounded, onMedia: true, onPressed: onRecordings),
+      if (camera.ptz == true) ...[
+        TvButton(label: 'Step $step°', icon: Icons.straighten_rounded, onMedia: true, onPressed: onStep),
+        TvButton(label: 'Pan & tilt', icon: Icons.open_with_rounded, onMedia: true, onPressed: onHide),
+      ],
+      TvButton(label: 'Reconnect', icon: Icons.refresh_rounded, onMedia: true, onPressed: onReconnect),
+      // The privacy button comes first so it takes the initial focus.
+      if (hasMultiple) ...[
+        TvButton(label: 'Previous', icon: Icons.skip_previous_rounded, onMedia: true, onPressed: onPrev),
+        TvButton(label: 'Next', icon: Icons.skip_next_rounded, onMedia: true, onPressed: onNext),
+      ],
+      TvButton(label: '', semanticLabel: 'Remote guide', icon: Icons.help_outline_rounded, onMedia: true, onPressed: onGuide),
+    ];
     return Container(
-      padding: const EdgeInsets.fromLTRB(48, 60, 48, 28),
+      padding: const EdgeInsets.fromLTRB(0, 60, 0, 28),
       decoration: const BoxDecoration(
         gradient: LinearGradient(
           begin: Alignment.bottomCenter,
@@ -466,45 +607,37 @@ class _Controls extends StatelessWidget {
         mainAxisSize: MainAxisSize.min,
         children: [
           FocusTraversalGroup(
-            child: Row(
-              mainAxisAlignment: MainAxisAlignment.center,
-              children: [
-                if (hasMultiple) ...[
-                  TvButton(label: 'Previous', icon: Icons.skip_previous_rounded, onMedia: true, onPressed: onPrev),
-                  const SizedBox(width: 10),
-                ],
-                TvButton(
-                  label: privacy ? 'Turn privacy off' : 'Turn privacy on',
-                  icon: privacy ? Icons.visibility_off_rounded : Icons.visibility_rounded,
-                  onMedia: true,
-                  focusNode: firstFocus,
-                  busy: privacyBusy || camera.privacy == null,
-                  style: privacy ? TvButtonStyle.primary : TvButtonStyle.secondary,
-                  onPressed: onPrivacy,
+            // One row that scrolls sideways when the buttons do not fit 960 px;
+            // Right/Left always reach the next button and scroll it into view.
+            child: LayoutBuilder(
+              builder: (context, box) => SingleChildScrollView(
+                scrollDirection: Axis.horizontal,
+                padding: const EdgeInsets.symmetric(horizontal: 56, vertical: 8),
+                child: ConstrainedBox(
+                  constraints: BoxConstraints(minWidth: (box.maxWidth - 112).clamp(0, double.infinity)),
+                  child: Row(
+                    mainAxisSize: MainAxisSize.min,
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      for (final (i, button) in buttons.indexed) ...[
+                        if (i > 0) const SizedBox(width: 10),
+                        button,
+                      ],
+                    ],
+                  ),
                 ),
-                const SizedBox(width: 10),
-                if (camera.ptz == true) ...[
-                  TvButton(label: 'Step $step°', icon: Icons.straighten_rounded, onMedia: true, onPressed: onStep),
-                  const SizedBox(width: 10),
-                  TvButton(label: 'Pan & tilt', icon: Icons.open_with_rounded, onMedia: true, onPressed: onHide),
-                  const SizedBox(width: 10),
-                ],
-                TvButton(label: 'Reconnect', icon: Icons.refresh_rounded, onMedia: true, onPressed: onReconnect),
-                const SizedBox(width: 10),
-                TvButton(label: '', icon: Icons.help_outline_rounded, onMedia: true, onPressed: onGuide),
-                if (hasMultiple) ...[
-                  const SizedBox(width: 10),
-                  TvButton(label: 'Next', icon: Icons.skip_next_rounded, onMedia: true, onPressed: onNext),
-                ],
-              ],
+              ),
             ),
           ),
           const SizedBox(height: 14),
-          HintBar(onMedia: true, [
-            if (canPtz) (const KeyCap('', icon: Icons.arrow_back_rounded, onMedia: true), 'Hide controls, then use arrows to pan & tilt'),
-            if (!canPtz) (const KeyCap('', icon: Icons.arrow_back_rounded, onMedia: true), 'Hide controls'),
-            if (hasMultiple) (const KeyCap('CH ±', onMedia: true), 'Switch camera'),
-          ]),
+          Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 48),
+            child: HintBar(onMedia: true, [
+              if (canPtz) (const KeyCap('', icon: Icons.arrow_back_rounded, onMedia: true), 'Hide controls, then use arrows to pan & tilt'),
+              if (!canPtz) (const KeyCap('', icon: Icons.arrow_back_rounded, onMedia: true), 'Hide controls'),
+              if (hasMultiple) (const KeyCap('CH ±', onMedia: true), 'Switch camera'),
+            ]),
+          ),
         ],
       ),
     );

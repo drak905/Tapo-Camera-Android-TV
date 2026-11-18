@@ -6,10 +6,19 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../api/cloud_transport.dart';
 import '../api/relay_bridge.dart';
+import '../media/http_ts_source.dart';
 import '../api/tapo_cloud.dart';
+import '../media/remote_stream_gate.dart' show kDefaultMaxRemoteStreams, kMaxRemoteStreamsLimit;
 import '../player/stream_queue.dart';
+import 'camera_actions.dart';
+import 'camera_actions_impl.dart';
+import 'camera_sort.dart';
+import 'camera_view_model.dart';
 import 'grids.dart';
+import 'io_transports.dart';
+import 'secure_store.dart';
 
 enum AuthStage { starting, signedOut, mfa, signedIn }
 
@@ -18,13 +27,25 @@ class Camera {
   final Map<String, dynamic> raw;
 
   String get deviceId => '${raw['deviceId'] ?? ''}';
-  String get name => '${raw['alias'] ?? raw['deviceName'] ?? 'Camera'}'.trim();
+  String get name => view?.displayName ?? '${raw['alias'] ?? raw['deviceName'] ?? 'Camera'}'.trim();
   String get model => '${raw['deviceModel'] ?? ''}';
   String get firmware => '${raw['fwVer'] ?? ''}'.split(' ').first;
 
   /// Account list status; not a live reachability check (the relay can still
   /// work while this reports 0), so it is only used as a hint.
   bool get reportedOnline => raw['status'] == 1;
+
+  /// View model from the api lane (role, online, route, capabilities).
+  CameraViewModel? view;
+  bool get online => view?.online ?? reportedOnline;
+  CameraRoute get route => view?.route ?? CameraRoute.cloud;
+  bool get isShared => view?.isShared ?? ('${raw['role'] ?? 0}' != '0');
+  Set<CameraCapability> get capabilities => view?.capabilities ?? const {};
+  String? get localName => view?.localName;
+
+  /// null = unknown.
+  DayNightMode? dayNight;
+  bool? alarm;
 
   bool? privacy;
   bool? ptz;
@@ -61,13 +82,37 @@ class AppState extends ChangeNotifier {
   static const _kGrids = 'grids';
   static const _kActiveGrid = 'active_grid';
   static const _kFavoriteGrid = 'favorite_grid';
+  static const _kCameraSort = 'camera_sort';
+  static const _kMaxRemote = 'max_remote_streams';
+  static const _kRememberPassword = 'remember_password';
+  static const _kMotionNotifications = 'motion_notifications';
+
+  /// [secureStore] holds the session token (and the password only after the
+  /// opt-in); without it the session stays in shared_preferences (tests).
+  /// [useBackend] wires the real control, discovery and media stack.
+  AppState({SecureStore? secureStore, SecureBackend? secureBackend, this.useBackend = false})
+      : _secure = secureStore,
+        // ignore: prefer_initializing_formals
+        _secureBackend = secureBackend;
+
+  final SecureStore? _secure;
+  final SecureBackend? _secureBackend;
+  final bool useBackend;
+  CameraBackend? _backend;
 
   late SharedPreferences _prefs;
   late SecurityContext _context;
   bool _bootstrapped = false;
   TapoCloud? _client;
   String _baseUrl = loginUrl;
-  late final RelayBridge relay = RelayBridge(_resolveForRelay);
+  late final RelayBridge relay = useBackend && !demo
+      ? RelayBridge.sources((id, resolution) => _backend?.sourceFor(id, resolution))
+      : demo && _demoStream.isNotEmpty
+          // The native player only accepts bridge URLs, so the demo stream is
+          // proxied through the bridge like a camera.
+          ? RelayBridge.sources(
+              (id, _) => HttpTsSource(Uri.parse('$_demoStream?cam=${Uri.encodeComponent(id)}')))
+          : RelayBridge(_resolveForRelay);
 
   AuthStage stage = AuthStage.starting;
   PendingMfa? pendingMfa;
@@ -101,6 +146,10 @@ class AppState extends ChangeNotifier {
       ptzStep = _prefs.getInt(_kPtzStep) ?? 10;
       guideSeen = _prefs.getBool(_kGuideSeen) ?? false;
       accountHint = _prefs.getString(_kAccount) ?? '';
+      _cameraSort = CameraSort.parse(_prefs.getString(_kCameraSort));
+      _maxRemoteStreams = (_prefs.getInt(_kMaxRemote) ?? kDefaultMaxRemoteStreams).clamp(1, kMaxRemoteStreamsLimit);
+      _rememberPassword = _prefs.getBool(_kRememberPassword) ?? false;
+      _motionNotifications = _prefs.getBool(_kMotionNotifications) ?? true;
       _loadGrids();
       await Snapshots.instance.init();
       await relay.start();
@@ -119,6 +168,7 @@ class AppState extends ChangeNotifier {
         ])
           Camera({'deviceId': 'demo-$name', 'alias': name, 'deviceModel': model, '_ptz': ptz, '_privacy': privacy}),
       ];
+      actions ??= DemoCameraActions();
       stage = AuthStage.signedIn;
       notifyListeners();
       for (final c in cameras) {
@@ -127,29 +177,54 @@ class AppState extends ChangeNotifier {
       return;
     }
 
-    final saved = _prefs.getString(_kSession);
+    final saved = await _loadSession();
     if (saved != null) {
       try {
-        final session = jsonDecode(saved) as Map<String, dynamic>;
-        final client = _newClient()..token = '${session['token']}';
-        final baseUrl = '${session['base_url'] ?? loginUrl}';
+        final client = (await _newClient())..token = saved.token;
+        final baseUrl = saved.baseUrl;
         final devices = await client.listCameras(baseUrl);
         _setSignedIn(client, baseUrl, devices);
         return;
       } on TapoException catch (e) {
-        if (e.code != null) await _prefs.remove(_kSession);
+        if (e.code != null) await _clearSession();
         // Without a code it was a network problem: keep the session and let
         // the user retry from the sign-in screen.
         camerasError = e.message;
       } catch (_) {
-        await _prefs.remove(_kSession);
+        await _clearSession();
       }
     }
     stage = AuthStage.signedOut;
     notifyListeners();
   }
 
-  bool get hasSavedSession => _prefs.getString(_kSession) != null;
+  bool _hasSession = false;
+  bool get hasSavedSession => _hasSession || _prefs.getString(_kSession) != null;
+
+  Future<StoredSession?> _loadSession() async {
+    final secure = _secure;
+    if (secure != null) {
+      await secure.migrateLegacySession(_PrefsLegacy(_prefs));
+      final stored = await secure.loadSession();
+      _hasSession = stored != null;
+      return stored;
+    }
+    final raw = _prefs.getString(_kSession);
+    if (raw == null) return null;
+    try {
+      final session = jsonDecode(raw) as Map<String, dynamic>;
+      return StoredSession(baseUrl: '${session['base_url'] ?? loginUrl}', token: '${session['token']}');
+    } catch (_) {
+      await _prefs.remove(_kSession);
+      return null;
+    }
+  }
+
+  Future<void> _clearSession() async {
+    _hasSession = false;
+    await _prefs.remove(_kSession);
+    await _secure?.signOut();
+  }
 
   Future<void> retrySavedSession() async {
     stage = AuthStage.starting;
@@ -157,14 +232,18 @@ class AppState extends ChangeNotifier {
     await init();
   }
 
-  TapoCloud _newClient() {
+  Future<String> _terminalUuid() async {
+    final secure = _secure;
+    if (secure != null) return secure.terminalUuid();
     var terminal = _prefs.getString(_kTerminal);
     if (terminal == null || terminal.isEmpty) {
       terminal = randomUuid().replaceAll('-', '').toUpperCase();
-      _prefs.setString(_kTerminal, terminal);
+      await _prefs.setString(_kTerminal, terminal);
     }
-    return TapoCloud(terminalUuid: terminal, context: _context);
+    return terminal;
   }
+
+  Future<TapoCloud> _newClient() async => TapoCloud(terminalUuid: await _terminalUuid(), context: _context);
 
   (TapoCloud, String, Map<String, dynamic>)? _resolveForRelay(String deviceId) {
     final client = _client;
@@ -180,8 +259,7 @@ class AppState extends ChangeNotifier {
   /// `adb reverse tcp:8099 tcp:8099`.
   static const _demoStream = String.fromEnvironment('TOPO_DEMO_STREAM');
 
-  String streamUrl(Camera camera) =>
-      demo && _demoStream.isNotEmpty ? '$_demoStream?cam=${Uri.encodeComponent(camera.deviceId)}' : relay.urlFor(camera.deviceId);
+  String streamUrl(Camera camera) => relay.urlFor(camera.deviceId);
 
   // ---------------------------------------------------------------- Auth --
 
@@ -191,7 +269,7 @@ class AppState extends ChangeNotifier {
     if (username.isEmpty || password.isEmpty) {
       throw TapoException('Enter your Tapo email and password');
     }
-    final client = _newClient();
+    final client = await _newClient();
     final result = await client.login(username, password);
     final processId = result.mfaProcessId;
     accountHint = username;
@@ -210,7 +288,7 @@ class AppState extends ChangeNotifier {
       notifyListeners();
       return true;
     }
-    await _finishLogin(client, result.baseUrl, result.result);
+    await _finishLogin(client, result.baseUrl, result.result, username: username, password: password);
     return false;
   }
 
@@ -232,7 +310,7 @@ class AppState extends ChangeNotifier {
     code = code.trim();
     if (code.isEmpty) throw TapoException('Enter the verification code');
     final result = await client.verifyMfa(pending.baseUrl, pending.username, code, pending.processId, type);
-    await _finishLogin(client, pending.baseUrl, result);
+    await _finishLogin(client, pending.baseUrl, result, username: pending.username, password: pending.password);
   }
 
   void cancelMfa() {
@@ -241,23 +319,41 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
-  Future<void> _finishLogin(TapoCloud client, String baseUrl, Map<String, dynamic> result) async {
+  Future<void> _finishLogin(
+    TapoCloud client,
+    String baseUrl,
+    Map<String, dynamic> result, {
+    String? username,
+    String? password,
+  }) async {
     final token = result['token'];
     if (token == null || '$token'.isEmpty) {
       throw TapoException('The cloud did not return a session token');
     }
     client.token = '$token';
     final devices = await client.listCameras(baseUrl);
-    // Only the session token is stored; the password never is.
-    await _prefs.setString(
-      _kSession,
-      jsonEncode({
-        'base_url': baseUrl,
-        'token': '$token',
-        'refreshToken': result['refreshToken'],
-        'saved_at': DateTime.now().millisecondsSinceEpoch ~/ 1000,
-      }),
-    );
+    // The password is stored only after the explicit opt-in (secure storage).
+    final secure = _secure;
+    if (secure != null) {
+      await secure.saveSession(StoredSession(baseUrl: baseUrl, token: '$token'));
+      if (_rememberPassword && username != null && password != null) {
+        await secure.savePassword(username, password);
+      }
+    } else {
+      await _prefs.setString(
+        _kSession,
+        jsonEncode({
+          'base_url': baseUrl,
+          'token': '$token',
+          'refreshToken': result['refreshToken'],
+          'saved_at': DateTime.now().millisecondsSinceEpoch ~/ 1000,
+        }),
+      );
+    }
+    _hasSession = true;
+    if (_rememberPassword && useBackend && username != null && password != null) {
+      client.rememberCredentials(username: username, password: password, baseUrl: baseUrl);
+    }
     pendingMfa = null;
     _setSignedIn(client, baseUrl, devices);
   }
@@ -269,20 +365,73 @@ class AppState extends ChangeNotifier {
     cameras = devices.map(Camera.new).toList();
     camerasError = null;
     stage = AuthStage.signedIn;
+    if (cameras.isNotEmpty) cleanGridSlots();
     notifyListeners();
     for (final camera in cameras) {
       unawaited(refreshCameraState(camera));
     }
+    if (useBackend) unawaited(_attachBackend(client, baseUrl));
+  }
+
+  /// Builds the real control/discovery/media stack and gives every camera its
+  /// view model (route, role, online, capabilities).
+  Future<void> _attachBackend(TapoCloud client, String baseUrl) async {
+    try {
+      _backend?.close();
+      final backend = CameraBackend(
+        cloud: client,
+        baseUrl: baseUrl,
+        terminalUuid: await _terminalUuid(),
+        transport: HttpCloudTransport(_context),
+        maxRemoteStreams: _maxRemoteStreams,
+        secureStore: _secure,
+        secureBackend: _secureBackend,
+        prefs: _prefs,
+        pins: PrefsPinStore(_prefs),
+        tlsContext: _context,
+        rememberPassword: () => _rememberPassword,
+      );
+      _backend = backend;
+      actions = backend.actions;
+      await _applyViews(backend);
+      backend.startMotion(() => [for (final c in cameras) c.deviceId]);
+    } catch (e) {
+      camerasError = e.toString();
+      _handleAuthFailure(e);
+      notifyListeners();
+    }
+  }
+
+  Future<void> _applyViews(CameraBackend backend) async {
+    final devices = [for (final c in cameras) c.raw];
+    final views = await backend.loadViews(devices);
+    for (final camera in cameras) {
+      final view = views[camera.deviceId];
+      if (view != null) camera.view = view;
+    }
+    notifyListeners();
+    // Optional controls (night vision, siren) appear once a camera has said
+    // which components it has.
+    unawaited(backend.loadCapabilities(devices, (id, view) {
+      final camera = cameraById(id);
+      if (camera == null) return;
+      camera.view = view;
+      notifyListeners();
+    }));
   }
 
   Future<void> logout() async {
     _client?.close();
     _client = null;
+    _backend?.close();
+    _backend = null;
+    if (!demo) actions = null;
+    if (useBackend) await PrefsPinStore(_prefs).clear();
     cameras = [];
     pendingMfa = null;
-    await _prefs.remove(_kSession);
+    await _clearSession();
     // Forget the terminal identity too so the next sign-in asks for MFA.
-    await _prefs.remove(_kTerminal);
+    if (_secure == null) await _prefs.remove(_kTerminal);
     stage = AuthStage.signedOut;
     notifyListeners();
   }
@@ -312,6 +461,9 @@ class AppState extends ChangeNotifier {
         camera.ptz = old?.ptz;
         return camera;
       }).toList();
+      if (cameras.isNotEmpty) cleanGridSlots();
+      final backend = _backend;
+      if (backend != null) unawaited(_applyViews(backend));
       for (final camera in cameras) {
         unawaited(refreshCameraState(camera, force: true));
       }
@@ -333,6 +485,24 @@ class AppState extends ChangeNotifier {
     }
     final client = _client;
     if (client == null) return;
+    final backend = _backend;
+    if (backend != null) {
+      final checked = camera.checkedAt;
+      if (!force && checked != null && DateTime.now().difference(checked) < const Duration(seconds: 10)) return;
+      camera.checkedAt = DateTime.now();
+      try {
+        final status = await backend.readStatus(camera.deviceId);
+        camera.privacy = status.privacy;
+        camera.dayNight = status.dayNight;
+        camera.ptz = status.ptz;
+        camera.stateError = null;
+      } catch (e) {
+        camera.stateError = e.toString();
+        _handleAuthFailure(e);
+      }
+      notifyListeners();
+      return;
+    }
     final checked = camera.checkedAt;
     if (!force && checked != null && DateTime.now().difference(checked) < const Duration(seconds: 10)) {
       return;
@@ -362,6 +532,13 @@ class AppState extends ChangeNotifier {
     }
     final client = _client;
     if (client == null) return;
+    final backend = _backend;
+    if (backend != null) {
+      camera.privacy = await backend.setPrivacy(camera.deviceId, enabled);
+      camera.checkedAt = DateTime.now();
+      notifyListeners();
+      return;
+    }
     camera.privacy = await client.setPrivacyMode(_baseUrl, camera.deviceId, enabled);
     camera.checkedAt = DateTime.now();
     notifyListeners();
@@ -371,6 +548,8 @@ class AppState extends ChangeNotifier {
     if (demo) return Future<void>.delayed(const Duration(milliseconds: 300));
     final client = _client;
     if (client == null) return;
+    final backend = _backend;
+    if (backend != null) return backend.move(camera.deviceId, x, y);
     await client.moveMotor(_baseUrl, camera.deviceId, x, y);
   }
 
@@ -418,12 +597,13 @@ class AppState extends ChangeNotifier {
 
   /// Built-in grid showing every camera (first nine) in a fitting layout.
   GridPreset get allCamerasGrid {
-    final layout = GridLayout.fitting(cameras.length);
+    final ordered = sortedCameras;
+    final layout = GridLayout.fitting(ordered.length);
     return GridPreset(
       id: GridPreset.allCamerasId,
       name: 'All cameras',
       layout: layout,
-      slots: [for (final c in cameras.take(layout.slots)) c.deviceId],
+      slots: [for (final c in ordered.take(layout.slots)) c.deviceId],
     );
   }
 
@@ -440,7 +620,8 @@ class AppState extends ChangeNotifier {
     return null;
   }
 
-  int cameraIndex(String deviceId) => cameras.indexWhere((c) => c.deviceId == deviceId);
+  /// Index in the sorted list, which is what the live view and the digit keys use.
+  int cameraIndex(String deviceId) => sortedCameras.indexWhere((c) => c.deviceId == deviceId);
 
   GridPreset? get favoriteGrid {
     final id = favoriteGridId;
@@ -503,5 +684,181 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+  // ------------------------------------------- Sort, limits, camera account --
+
+  CameraSort _cameraSort = CameraSort.nameAsc;
+  int _maxRemoteStreams = kDefaultMaxRemoteStreams;
+  bool _rememberPassword = false;
+
+  /// Control interface (api lane adapter, or a fake in tests).
+  CameraActions? get actions => _actions;
+  CameraActions? _actions;
+  set actions(CameraActions? value) {
+    _actions = value;
+    _motionSub?.cancel();
+    _motionSub = value?.motionEvents.listen(_motionEvents.add, onError: (Object _) {});
+  }
+
+  final _motionEvents = StreamController<MotionEvent>.broadcast();
+  StreamSubscription<MotionEvent>? _motionSub;
+
+  /// Motion events of the current control interface (the toast host listens).
+  Stream<MotionEvent> get motionEvents => _motionEvents.stream;
+
+  bool _motionNotifications = true;
+
+  /// Motion toasts on or off (default on).
+  bool get motionNotifications => _motionNotifications;
+
+  Future<void> setMotionNotifications(bool value) async {
+    _motionNotifications = value;
+    await _prefs.setBool(_kMotionNotifications, value);
+    notifyListeners();
+  }
+
+  CameraSort get cameraSort => _cameraSort;
+
+  Future<void> setCameraSort(CameraSort sort) async {
+    _cameraSort = sort;
+    await _prefs.setString(_kCameraSort, sort.storageValue);
+    notifyListeners();
+  }
+
+  /// Cameras in the chosen sort order (home list, live prev/next, digit keys,
+  /// the "All cameras" grid).
+  List<Camera> get sortedCameras => sortCameras<Camera>(cameras, _cameraSort, (c) => c.name);
+
+  /// 1..8, default 4.
+  int get maxRemoteStreams => _maxRemoteStreams;
+
+  Future<void> setMaxRemoteStreams(int value) async {
+    _maxRemoteStreams = value.clamp(1, kMaxRemoteStreamsLimit);
+    await _prefs.setInt(_kMaxRemote, _maxRemoteStreams);
+    _backend?.setMaxRemoteStreams(_maxRemoteStreams);
+    notifyListeners();
+  }
+
+  /// Opt-in, default false. While off, a stored password is never read; sign
+  /// out deletes it (SecureStore.signOut).
+  bool get rememberPassword => _rememberPassword;
+
+  Future<void> setRememberPassword(bool value) async {
+    _rememberPassword = value;
+    await _prefs.setBool(_kRememberPassword, value);
+    notifyListeners();
+  }
+
+  CameraActions _requireActions() =>
+      actions ?? (throw const CameraActionException('Camera control is not available yet'));
+
+  /// Optimistic update; restores the previous value and rethrows on failure.
+  Future<void> setDayNight(Camera camera, DayNightMode mode) async {
+    final control = _requireActions();
+    final previous = camera.dayNight;
+    camera.dayNight = mode;
+    notifyListeners();
+    try {
+      camera.dayNight = await control.setDayNight(camera.deviceId, mode);
+    } catch (_) {
+      camera.dayNight = previous;
+      rethrow;
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  Future<void> setAlarm(Camera camera, bool on) async {
+    final control = _requireActions();
+    final previous = camera.alarm;
+    camera.alarm = on;
+    notifyListeners();
+    try {
+      camera.alarm = await control.setAlarm(camera.deviceId, on);
+    } catch (_) {
+      camera.alarm = previous;
+      rethrow;
+    } finally {
+      notifyListeners();
+    }
+  }
+
+  CameraViewModel _baseView(Camera camera) =>
+      camera.view ?? CameraViewModel(id: camera.deviceId, displayName: camera.name, model: camera.model, online: camera.online);
+
+  /// Owned: renames on the camera; shared/manual: local display name only.
+  Future<void> renameCamera(Camera camera, String name) async {
+    final control = _requireActions();
+    final view = _baseView(camera);
+    if (camera.isShared) {
+      await control.setLocalName(camera.deviceId, name);
+      camera.view = view.copyWith(displayName: name, localName: name);
+    } else {
+      await control.renameOnCamera(camera.deviceId, name);
+      camera.view = view.copyWith(displayName: name, clearLocalName: true);
+    }
+    notifyListeners();
+  }
+
+  /// Removes the local name of a shared camera; the cloud alias shows again.
+  Future<void> resetCameraName(Camera camera) async {
+    final control = _requireActions();
+    await control.setLocalName(camera.deviceId, null);
+    final alias = '${camera.raw['alias'] ?? camera.raw['deviceName'] ?? 'Camera'}'.trim();
+    camera.view = _baseView(camera).copyWith(displayName: alias, clearLocalName: true);
+    notifyListeners();
+  }
+
+  /// Per-camera account (RTSP/ONVIF), if one is stored.
+  Future<String?> cameraAccountUser(Camera camera) async => actions?.cameraAccountUser(camera.deviceId);
+
+  /// Empty username and password clear the account. Otherwise exactly one
+  /// login test is made and the account is saved only when it works.
+  Future<bool> saveCameraAccount(Camera camera, String username, String password) async {
+    final control = _requireActions();
+    if (username.isEmpty && password.isEmpty) {
+      await control.clearCameraAccount(camera.deviceId);
+      return true;
+    }
+    if (!await control.testCameraAccount(camera.deviceId, username, password)) return false;
+    await control.saveCameraAccount(camera.deviceId, username, password);
+    return true;
+  }
+
+  /// Drops unknown camera ids and duplicates inside one saved grid. Cameras
+  /// added later are never put into a saved grid.
+  void cleanGridSlots() {
+    final known = {for (final c in cameras) c.deviceId};
+    var changed = false;
+    savedGrids = [
+      for (final grid in savedGrids)
+        () {
+          final seen = <String>{};
+          final slots = <String?>[
+            for (final id in grid.slots)
+              if (id != null && known.contains(id) && seen.add(id)) id else null,
+          ];
+          if (!listEquals(slots, grid.slots)) changed = true;
+          return grid.copyWith(slots: slots);
+        }(),
+    ];
+    if (changed) {
+      unawaited(_saveGrids());
+      notifyListeners();
+    }
+  }
+
   String get regionHost => Uri.tryParse(_baseUrl)?.host ?? _baseUrl;
+}
+
+/// Lets [SecureStore.migrateLegacySession] read and remove the old
+/// shared_preferences session.
+class _PrefsLegacy implements LegacySessionPrefs {
+  _PrefsLegacy(this._prefs);
+  final SharedPreferences _prefs;
+
+  @override
+  String? getString(String key) => _prefs.getString(key);
+
+  @override
+  Future<void> remove(String key) => _prefs.remove(key);
 }

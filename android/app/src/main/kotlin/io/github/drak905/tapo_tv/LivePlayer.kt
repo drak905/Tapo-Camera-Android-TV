@@ -61,8 +61,8 @@ private class LiveVideoView(
 ) : PlatformView {
     private val handler = Handler(Looper.getMainLooper())
     private val textureView = TextureView(context).apply {
-        isFocusable = false
-        isFocusableInTouchMode = false
+        isFocusable = PlayerPolicy.videoViewFocusable
+        isFocusableInTouchMode = PlayerPolicy.videoViewFocusable
         importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
     }
     private val player: ExoPlayer
@@ -169,10 +169,16 @@ private class LiveVideoView(
                 emit(mapOf("state" to "error", "message" to (error.cause?.message ?: error.message)))
             }
         })
-        player.setMediaSource(source)
-        player.playWhenReady = true
-        player.prepare()
-        handler.postDelayed(latencyWatch, 1000)
+        // Only the app's own loopback bridge is played (plain MPEG-TS with the
+        // per-launch key); anything else is reported instead of opened.
+        if (PlayerPolicy.isBridgeUrl(url)) {
+            player.setMediaSource(source)
+            player.playWhenReady = true
+            player.prepare()
+            handler.postDelayed(latencyWatch, 1000)
+        } else {
+            handler.post { if (!released) emit(mapOf("state" to "error", "message" to "Invalid stream address")) }
+        }
     }
 
     override fun getView(): View = textureView
@@ -184,12 +190,11 @@ private class LiveVideoView(
          * Real TVs keep their hardware decoders.
          */
         private val isEmulator: Boolean =
-            Build.HARDWARE.contains("goldfish") || Build.HARDWARE.contains("ranchu") ||
-                Build.PRODUCT.startsWith("sdk_") || Build.FINGERPRINT.contains("generic")
+            PlayerPolicy.isEmulator(Build.HARDWARE, Build.PRODUCT, Build.FINGERPRINT)
 
         fun renderersFactory(context: Context): DefaultRenderersFactory {
             val factory = DefaultRenderersFactory(context).setEnableDecoderFallback(true)
-            if (!isEmulator) return factory
+            if (!PlayerPolicy.preferSoftwareDecoders(isEmulator)) return factory
             return factory.setMediaCodecSelector { mimeType, secure, tunneling ->
                 MediaCodecSelector.DEFAULT.getDecoderInfos(mimeType, secure, tunneling)
                     .sortedBy { it.hardwareAccelerated }
