@@ -2,6 +2,7 @@
 // Spec: hc.discovery.tdp_packet / tdp_reply / tdp_encrypt_info / targets.
 
 import 'dart:convert';
+import 'dart:io';
 import 'dart:isolate';
 import 'dart:math';
 import 'dart:typed_data';
@@ -343,4 +344,90 @@ List<(String host, int port)> tdpTargets(List<TdpInterface> interfaces) {
   return [
     for (final h in hosts) ...[(h, 20002), (h, 20004)],
   ];
+}
+
+/// Local IPv4 interfaces for [tdpTargets]. dart:io does not report the prefix
+/// length, so every address is treated as a /24 (the home-network default).
+Future<List<TdpInterface>> localTdpInterfaces() async {
+  final out = <TdpInterface>[];
+  try {
+    for (final nic in await NetworkInterface.list(type: InternetAddressType.IPv4)) {
+      for (final a in nic.addresses) {
+        out.add(TdpInterface(a.address, 24));
+      }
+    }
+  } catch (_) {
+    // no interface list: the limited broadcast target still works
+  }
+  return out;
+}
+
+/// TDP discovery loop (Windows `discovery/tdp.py` `discover`): one random
+/// serial, the probe sent to every target [attempts] times [interval] apart,
+/// replies collected until [timeout], deduplicated by MAC (first reply wins)
+/// and sorted by IP. Never throws for network problems (send failures to a
+/// target are skipped; a bind failure returns an empty list).
+/// [targets] defaults to [tdpTargets] of the local interfaces.
+Future<List<TdpDevice>> discoverTdp({
+  List<(String host, int port)>? targets,
+  Duration timeout = const Duration(seconds: 3),
+  int attempts = 3,
+  Duration interval = const Duration(milliseconds: 300),
+  TdpKeyPair? keys,
+}) async {
+  final pair = keys ?? await sharedTdpKeyPair();
+  final serial = Random.secure().nextInt(1 << 28);
+  final probe = buildTdpProbe(payloadJson: tdpProbePayload(pair.publicKeyPem), serial: serial);
+  final dests = targets ?? tdpTargets(await localTdpInterfaces());
+
+  final RawDatagramSocket socket;
+  try {
+    socket = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0, reuseAddress: true);
+  } catch (_) {
+    return const [];
+  }
+  socket.broadcastEnabled = true;
+
+  final found = <String, TdpDevice>{};
+  final sub = socket.listen((event) {
+    if (event != RawSocketEvent.read) return;
+    Datagram? d;
+    while ((d = socket.receive()) != null) {
+      for (final device in parseTdpDatagram(d!.data, serial: serial, senderIp: d.address.address, keys: pair)) {
+        final key = normaliseMac(device.mac).isNotEmpty ? normaliseMac(device.mac) : (device.mac.isNotEmpty ? device.mac : device.ip);
+        found.putIfAbsent(key, () => device);
+      }
+    }
+  }, onError: (Object _) {
+    // e.g. WSAECONNRESET after an ICMP port unreachable on Windows
+  });
+
+  void sendAll() {
+    for (final (host, port) in dests) {
+      try {
+        socket.send(probe, InternetAddress(host), port);
+      } catch (_) {
+        // unreachable network / invalid target: skip it
+      }
+    }
+  }
+
+  final rounds = attempts < 1 ? 1 : attempts;
+  final clock = Stopwatch()..start();
+  try {
+    for (var i = 0; i < rounds && clock.elapsed < timeout; i++) {
+      sendAll();
+      if (i + 1 < rounds) {
+        final left = timeout - clock.elapsed;
+        await Future<void>.delayed(interval < left ? interval : left);
+      }
+    }
+    final left = timeout - clock.elapsed;
+    if (left > Duration.zero) await Future<void>.delayed(left);
+  } finally {
+    await sub.cancel();
+    socket.close();
+  }
+  int ipKey(String ip) => ip.split('.').fold<int>(0, (v, p) => (v << 8) | (int.tryParse(p) ?? 0));
+  return found.values.toList()..sort((a, b) => ipKey(a.ip).compareTo(ipKey(b.ip)));
 }
