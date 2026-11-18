@@ -35,7 +35,12 @@ typedef TransportConnector = Future<MediaTransport> Function(
 SecurityContext? mediaTlsContext;
 
 class _SocketTransport implements MediaTransport {
-  _SocketTransport(this._socket);
+  _SocketTransport(this._socket) {
+    // Write errors after a peer reset are reported on `done`; without a
+    // handler they become uncaught zone errors (Windows 10053/10054). The
+    // read side ([input]) already carries the failure to the protocol code.
+    _socket.done.ignore();
+  }
   final Socket _socket;
   bool _closed = false;
 
@@ -45,7 +50,11 @@ class _SocketTransport implements MediaTransport {
   @override
   void add(List<int> data) {
     if (_closed) return;
-    _socket.add(data);
+    try {
+      _socket.add(data);
+    } on StateError {
+      // sink already closed by a peer reset; the input side reports it
+    }
   }
 
   @override

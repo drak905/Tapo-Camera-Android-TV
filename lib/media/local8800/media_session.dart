@@ -269,6 +269,12 @@ class MediaSession {
   /// `X-Session-Id` header; null until known.
   String? get sessionId => _sessionId;
 
+  /// Pushes queued client parts to the socket.
+  Future<void> flush() async {
+    if (_closed) return;
+    await _transport.flush();
+  }
+
   Future<void> close() async {
     if (_closed) return;
     _closed = true;

@@ -222,22 +222,23 @@ class PreviewStream {
     _cancelled = true;
     if (_finished) return;
     _finished = true;
+    onSessionEnd?.call();
+    final s = session;
+    // Windows order: stop request, linger, then close. The read side stays
+    // subscribed until the stop is out: cancelling a (TLS) socket's input
+    // first may shut the connection before the stop request is written.
+    if (s != null && s.sessionId != null) {
+      try {
+        await s.sendJson(stopRequestJson(s.nextSeq()));
+        await s.flush();
+        await Future<void>.delayed(stopLinger);
+      } catch (_) {}
+    }
     final sub = _sub;
     _sub = null;
     unawaited(sub?.cancel());
-    onSessionEnd?.call();
-    final s = session;
-    if (s != null) {
-      if (s.sessionId != null) {
-        try {
-          await s.sendJson(stopRequestJson(s.nextSeq()));
-          await Future<void>.delayed(stopLinger);
-        } catch (_) {}
-      }
-      _releaseLease();
-      await s.close();
-    }
     _releaseLease();
+    await s?.close();
   }
   void _releaseLease() {
     _lease?.release();
