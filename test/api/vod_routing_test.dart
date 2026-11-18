@@ -43,7 +43,7 @@ void main() {
 
   test('unreachable camera fails fast with reason', () {
     final remote = chooseVodTransport(_cam(route: CameraRoute.cloud), relayAvailable: false);
-    expect(remote.kind, isNull);
+    expect(remote.kind, VodTransportKind.none);
     expect(remote.failure, VodFailReason.notOnThisNetwork);
 
     final offline = chooseVodTransport(
