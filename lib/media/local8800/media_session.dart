@@ -174,7 +174,9 @@ class MediaSession {
       },
       onPause: () => sub?.pause(),
       onResume: () => sub?.resume(),
-      onCancel: () => sub?.cancel(),
+      onCancel: () {
+        unawaited(sub?.cancel());
+      },
     );
     return out.stream;
   }

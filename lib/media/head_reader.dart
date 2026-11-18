@@ -119,7 +119,10 @@ class HeadReader {
     final c = StreamController<Uint8List>(
       onPause: () => _sub.pause(),
       onResume: () => _sub.resume(),
-      onCancel: () => _sub.cancel(),
+      // Not returning the cancel future: a done event must not wait for it.
+      onCancel: () {
+        unawaited(_sub.cancel());
+      },
     );
     _rest = c;
     if (_buf.isNotEmpty) c.add(_buf);
