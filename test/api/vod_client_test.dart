@@ -94,7 +94,7 @@ void main() {
         DateTime(2024, 2, 9),
         DateTime(2024, 3, 1),
       );
-      expect(days, ['20240209']);
+      expect(days, ['2024-02-09']);
       expect(control.requests.single['method'], 'searchDateWithVideo');
     });
 
