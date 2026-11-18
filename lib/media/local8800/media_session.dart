@@ -66,7 +66,8 @@ class MediaSession {
     try {
       transport.add(latin1.encode('$baseHead\r\n\r\n'));
       var head = await reader.readHead(timeout: timeout);
-      await _skipBody(reader, head, timeout);
+      var body = await _readBody(reader, head, timeout);
+      String? encryptType;
 
       if (head.status == 401) {
         final DigestChallenge challenge;
@@ -75,6 +76,7 @@ class MediaSession {
         } on FormatException {
           throw const MediaAuthException('camera sent no usable Digest challenge');
         }
+        encryptType = challenge.encryptType;
         if ((head.headers['connection'] ?? '').toLowerCase() == 'close') {
           await reader.dispose();
           await transport.close();
@@ -89,13 +91,15 @@ class MediaSession {
         );
         transport.add(latin1.encode('$baseHead\r\nAuthorization: $authorization\r\n\r\n'));
         head = await reader.readHead(timeout: timeout);
-        await _skipBody(reader, head, timeout);
+        body = await _readBody(reader, head, timeout);
         if (head.status == 401) {
           throw const MediaAuthException('camera rejected the credentials');
         }
       }
-      if (head.status == 503) {
-        throw const StreamLimitException('camera refused another media session (HTTP 503)');
+      final code = _errorCode(body);
+      if (head.status == 503 || code == -52407) {
+        throw StreamLimitException('camera refused another media session (HTTP ${head.status})',
+            errorCode: code ?? -52407);
       }
       if (head.status != 200) {
         throw MediaException('camera answered the media request with HTTP ${head.status}');
@@ -110,10 +114,14 @@ class MediaSession {
         } on FormatException {
           throw const MediaException('camera sent an invalid Key-Exchange header');
         }
+        // Windows `_setup_encryption`: both key schedules use the password
+        // transformed with the challenge's encrypt_type.
         if (ke.isHkdf) {
-          decryptor = HkdfPartDecryptor(deriveHkdfKeys(ke, plainSecret: auth.digestSecret));
+          decryptor = HkdfPartDecryptor(
+              deriveHkdfKeys(ke, plainSecret: auth.digestSecret, encryptType: encryptType));
         } else {
-          final keys = deriveMd5Keys(username: ke.username, nonce: ke.nonce, plainPassword: auth.digestSecret);
+          final keys = deriveMd5Keys(
+              username: ke.username, nonce: ke.nonce, plainPassword: auth.digestSecret, encryptType: encryptType);
           if (keys == null) throw const MediaException('camera uses a key exchange user that is not supported');
           decryptor = Md5PartDecryptor(keys);
         }
@@ -126,9 +134,20 @@ class MediaSession {
     }
   }
 
-  static Future<void> _skipBody(HeadReader reader, HttpHead head, Duration timeout) async {
+  /// Body of a non-200 answer (a 200 starts the multipart stream).
+  static Future<Uint8List> _readBody(HeadReader reader, HttpHead head, Duration timeout) async {
     final n = head.contentLength;
-    if (n > 0) await reader.readBytes(n > 65536 ? 65536 : n, timeout: timeout);
+    if (head.status == 200 || n <= 0) return Uint8List(0);
+    return reader.readBytes(n > 65536 ? 65536 : n, timeout: timeout);
+  }
+
+  static int? _errorCode(Uint8List body) {
+    if (body.isEmpty) return null;
+    try {
+      final v = jsonDecode(utf8.decode(body, allowMalformed: true));
+      if (v is Map) return int.tryParse('${v['error_code'] ?? ''}');
+    } catch (_) {}
+    return null;
   }
 
   final KeyExchange? keyExchange;
@@ -249,6 +268,12 @@ class MediaSession {
   /// Session id learned from `params.session_id`, `result.session_id` or the
   /// `X-Session-Id` header; null until known.
   String? get sessionId => _sessionId;
+
+  /// Pushes queued client parts to the socket.
+  Future<void> flush() async {
+    if (_closed) return;
+    await _transport.flush();
+  }
 
   Future<void> close() async {
     if (_closed) return;

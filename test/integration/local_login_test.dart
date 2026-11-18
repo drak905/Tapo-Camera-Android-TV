@@ -9,6 +9,7 @@ library;
 import 'package:flutter_test/flutter_test.dart';
 import 'package:tapo_tv/api/camera_control_client.dart';
 import 'package:tapo_tv/api/camera_dtos.dart';
+import 'package:tapo_tv/api/tapo_errors.dart';
 
 import '../fixtures/mock_camera.dart';
 import 'support/camera_rig.dart';
@@ -187,7 +188,7 @@ void main() {
       expect(cam.loginAttempts, lessThanOrEqualTo(3));
     });
 
-    test('wrong password: one failed share, breaker opens, no loop', () async {
+    test('wrong password: two failed shares (MAX_ATTEMPTS), breaker opens, no loop', () async {
       final cam = await _start(MockCamera(protocol: CameraProtocol.tpap, cloudPassword: 'pw-tpap'));
       final client = controlClientFor(cam, password: 'WRONG', hint: LocalProtocolHint.tpap);
       addTearDown(client.close);
@@ -196,25 +197,32 @@ void main() {
 
       expect(client.loggedIn, isFalse);
       expect(client.authRetryAfter, isNotNull);
-      expect(cam.tpapShareAttempts, 1);
-      expect(cam.loginAttempts, lessThanOrEqualTo(2));
+      // Windows tpap.py MAX_ATTEMPTS = 2 (md5 then sha256); test_tpap_login.py:166
+      // asserts exactly two shares for a wrong password.
+      expect(cam.tpapShareAttempts, 2);
+      expect(cam.loginAttempts, lessThanOrEqualTo(4), reason: '2 x (register + share)');
       final attempts = cam.loginAttempts;
       await expectLater(client.login(), throwsA(anything));
       await expectLater(client.send([buildGetDeviceInfo()]), throwsA(anything));
       expect(cam.loginAttempts, attempts);
     });
 
-    test('a locked camera (-40404) opens the breaker without hammering', () async {
+    test('a locked camera (-40404) stops at the register step, no password guess is spent', () async {
       final cam = await _start(MockCamera(protocol: CameraProtocol.tpap, cloudPassword: 'pw-tpap'));
       cam.lockLogin(const Duration(minutes: 5));
       final client = controlClientFor(cam, password: 'pw-tpap', hint: LocalProtocolHint.tpap);
       addTearDown(client.close);
 
-      await expectLater(client.login(), throwsA(anything));
+      // Lockout is NOT breakered (spec hc.local.breaker, Windows client.py:385,
+      // unit test 'lockout is not breakered'): every login is one register that
+      // answers -40404; no pake_share (password guess) is ever sent.
+      await expectLater(client.login(), throwsA(isA<TapoLockedError>()));
       final attempts = cam.loginAttempts;
-      expect(attempts, lessThanOrEqualTo(2));
-      await expectLater(client.login(), throwsA(anything));
-      expect(cam.loginAttempts, attempts);
+      expect(attempts, 1);
+      expect(client.authRetryAfter, isNull);
+      await expectLater(client.login(), throwsA(isA<TapoLockedError>()));
+      expect(cam.loginAttempts, attempts + 1);
+      expect(cam.tpapShareAttempts, 0);
     });
 
     test('TPAP session expiry mid-run: one re-login, the call succeeds', () async {

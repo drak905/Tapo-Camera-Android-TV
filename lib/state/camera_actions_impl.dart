@@ -20,13 +20,16 @@ import '../api/camera_dtos.dart' as dto;
 import '../api/camera_router.dart' as api;
 import '../api/camera_transport.dart';
 import '../api/cloud_passthrough.dart';
+import '../api/cloud_relay_auth.dart';
 import '../api/cloud_transport.dart';
 import '../api/iot_things.dart';
 import '../api/lan_matcher.dart';
 import '../api/tapo_cloud.dart';
+import '../api/tdp_discovery.dart';
 import '../api/tapo_errors.dart';
 import '../api/vod_client.dart' as vod;
 import '../api/vod_session.dart' as vs;
+import '../media/failover_source.dart';
 import '../media/local8800/local_ts_source.dart';
 import '../media/media_deps.dart';
 import '../media/media_errors.dart';
@@ -38,7 +41,6 @@ import '../media/stream_limiter.dart';
 import 'camera_actions.dart';
 import 'camera_names.dart';
 import 'camera_view_model.dart';
-import 'io_transports.dart';
 import 'secure_store.dart';
 
 // ------------------------------------------------------------ conversions --
@@ -87,65 +89,8 @@ CameraActionException describeCameraError(Object error) {
   if (error is TapoError) return CameraActionException(error.message);
   if (error is TimeoutException) return const CameraActionException('The camera did not answer');
   if (error is MediaException) return CameraActionException(error.message);
+  if (error is CloudTransportError) return CameraActionException(error.message);
   return const CameraActionException('The camera did not answer');
-}
-
-// ------------------------------------------------------------ media auth --
-
-class _LocalAuth implements LocalMediaAuth {
-  _LocalAuth(this.digestSecret);
-  @override
-  final String digestSecret;
-  @override
-  String get username => 'admin';
-}
-
-/// Cloud session facts for the relay (token, CIPC URL, signed POST, re-login).
-class _RelayAuth implements CloudRelayAuth {
-  _RelayAuth({
-    required this.cloud,
-    required this.baseUrl,
-    required this.transport,
-    required this.terminalUuid,
-    required this.relogin_,
-  });
-
-  final TapoCloud cloud;
-  final String baseUrl;
-  final CloudTransport transport;
-  final Future<void> Function() relogin_;
-
-  @override
-  final String terminalUuid;
-
-  @override
-  Future<String?> get token async {
-    final t = cloud.token;
-    return t.isEmpty ? null : t.split(';').first;
-  }
-
-  @override
-  Future<Uri> get cipcUrl async => Uri.parse(await cloud.discoverCipcUrl(baseUrl));
-
-  @override
-  String get clientModel => 'AndroidTV';
-
-  @override
-  String get appVersion => '3.22.806';
-
-  @override
-  Future<CipcResponse> postCipc(Uri url, Map<String, String> headers, Uint8List body) async {
-    final response = await transport.send(CloudRequest(method: 'POST', uri: url, headers: headers, body: body));
-    Map<String, dynamic> json = const {};
-    try {
-      final decoded = jsonDecode(utf8.decode(response.body));
-      if (decoded is Map) json = Map<String, dynamic>.from(decoded);
-    } catch (_) {}
-    return CipcResponse(response.status, json);
-  }
-
-  @override
-  Future<void> relogin() => relogin_();
 }
 
 // ----------------------------------------------------------- remote gate --
@@ -218,6 +163,13 @@ class BackendStatus {
 
 typedef DiscoverFn = Future<List<LanDevice>> Function();
 
+/// The production LAN discovery: the TDP loop (UDP 20002/20004, 3 s).
+Future<List<LanDevice>> discoverLanDevices() async =>
+    [for (final d in await discoverTdp()) d.toLanDevice()];
+
+/// The production camera link (TLS, certificate recorded for TOFU pinning).
+Future<CameraLink> connectCameraLink(String host, int port) => SocketCameraLink.connect(host, port);
+
 /// Owns the control stack for one signed-in session: IoT things, LAN
 /// discovery, per-camera routing, media sources, SD playback, motion polling
 /// and the optional per-camera account.
@@ -235,10 +187,12 @@ class CameraBackend {
     DiscoverFn? discover,
     CameraLinkFactory? linkFactory,
     TransportConnector? connector,
+    SecurityContext? tlsContext,
     this.rememberPassword = _never,
   })  : _discover = discover ?? discoverLanDevices,
         _linkFactory = linkFactory ?? connectCameraLink,
-        _connector = connector ?? connectSocketTransport,
+        _connector = connector ?? socketConnector(context: tlsContext),
+        _localConnector = connector ?? socketConnector(context: tlsContext, maxConnect: kLocalConnectTimeout),
         _gate = RemoteStreamGate(capacity: maxRemoteStreams) {
     passthrough = CloudPassthrough(
       transport: transport,
@@ -272,19 +226,30 @@ class CameraBackend {
   final DiscoverFn _discover;
   final CameraLinkFactory _linkFactory;
   final TransportConnector _connector;
+
+  /// :8800 connector with the short connect cap of the failover budget.
+  final TransportConnector _localConnector;
   final RemoteStreamGate _gate;
   final StreamLimiter _limiter = StreamLimiter();
 
   late final CloudPassthrough passthrough;
   late final api.CameraRouter router;
   late final LiveCameraActions actions;
-  late final _RelayAuth _relayAuth = _RelayAuth(
+  late final TapoCloudRelayAuth _relayAuth = TapoCloudRelayAuth(
     cloud: cloud,
-    baseUrl: baseUrl,
+    baseUrl: () => baseUrl,
     transport: transport,
     terminalUuid: terminalUuid,
-    relogin_: _relogin,
+    relogin: _relogin,
   );
+
+  /// Cloud session facts the relay sources use.
+  CloudRelayAuth get relayAuth => _relayAuth;
+
+  /// :8800 credentials of camera [id]: its LAT when known, else the cloud
+  /// password (opt-in), else empty (default media password).
+  LocalMediaAuth localMediaAuth(String id) =>
+      LocalSecretsMediaAuth(LocalSecrets(password: _password ?? '', lat: things[id]?.localAccessToken));
 
   final CameraNames names = CameraNames();
   final Map<String, api.TapoCamera> cameras = {};
@@ -551,22 +516,45 @@ class CameraBackend {
     if (camera == null || !camera.online) return null;
     final res = resolution == 'HD' ? 'HD' : 'VGA';
     final host = camera.lanIp;
+    RelayTsSource relay() =>
+        RelayTsSource(deviceId: id, auth: _relayAuth, connector: _connector, resolution: res, limiter: _limiter);
     if (camera.route == api.CameraRoute.local && host != null && !camera.isShared) {
-      return LocalTsSource(
-        host: host,
-        auth: _LocalAuth(things[id]?.localAccessToken ?? _password ?? ''),
-        connector: _connector,
-        resolution: res,
-        limiter: _limiter,
-        limiterKey: host,
+      // Owned camera on the LAN: local :8800 first; the relay takes over
+      // within 2.5 s when the local stream cannot start (signed in only).
+      return FailoverSource(
+        primary: LocalTsSource(
+          host: host,
+          auth: localMediaAuth(id),
+          connector: _localConnector,
+          resolution: res,
+          limiter: _limiter,
+          limiterKey: host,
+        ),
+        fallback: cloud.token.isEmpty || camera.isManual
+            ? null
+            : () => _GatedSource(relay(), _gate, id, preempt: true),
+        onFailover: (_) => _localFailed(id),
       );
     }
-    return _GatedSource(
-      RelayTsSource(deviceId: id, auth: _relayAuth, connector: _connector, resolution: res, limiter: _limiter),
-      _gate,
-      id,
-      preempt: true,
+    return _GatedSource(relay(), _gate, id, preempt: true);
+  }
+
+  /// The local stream of [id] could not start: later control calls of this
+  /// session go through the cloud until the next discovery.
+  void _localFailed(String id) {
+    final camera = cameras[id];
+    if (camera == null || camera.route != api.CameraRoute.local) return;
+    cameras[id] = api.TapoCamera(
+      id: camera.id,
+      name: camera.name,
+      model: camera.model,
+      role: camera.role,
+      online: camera.online,
+      route: api.CameraRoute.cloud,
+      isManual: camera.isManual,
+      capabilities: camera.capabilities,
     );
+    router.invalidate(id);
   }
 
   // ------------------------------------------------------------ motion --
@@ -650,7 +638,7 @@ class CameraBackend {
     final session = choice.kind == vod.VodTransportKind.local
         ? vs.VodSession.local(
             host: camera.lanIp!,
-            localAuth: _LocalAuth(things[id]?.localAccessToken ?? _password ?? ''),
+            localAuth: localMediaAuth(id),
             connector: _connector,
             startUtc: start,
             endUtc: end,

@@ -6,6 +6,7 @@ import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../api/cloud_transport.dart';
 import '../api/relay_bridge.dart';
 import '../api/tapo_cloud.dart';
 import '../media/remote_stream_gate.dart' show kDefaultMaxRemoteStreams, kMaxRemoteStreamsLimit;
@@ -382,6 +383,7 @@ class AppState extends ChangeNotifier {
         secureBackend: _secureBackend,
         prefs: _prefs,
         pins: PrefsPinStore(_prefs),
+        tlsContext: _context,
         rememberPassword: () => _rememberPassword,
       );
       _backend = backend;

@@ -134,6 +134,9 @@ class MockRelay {
     _server = await SecureServerSocket.bind(InternetAddress.loopbackIPv4, 0, _cert!.serverContext());
     _server!.listen((s) {
       s.setOption(SocketOption.tcpNoDelay, true);
+      // A client that resets mid-write must not surface as an uncaught
+      // 'Write failed' error in the test zone (10053/10054 on Windows).
+      s.done.ignore();
       final t = _Tunnel(this, s);
       _tunnels.add(t);
       t.run().whenComplete(() => _tunnels.remove(t));

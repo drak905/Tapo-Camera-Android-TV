@@ -6,6 +6,7 @@ import 'package:flutter_test/flutter_test.dart';
 import 'package:tapo_tv/media/local8800/stream_crypto.dart';
 import 'package:tapo_tv/media/media_errors.dart';
 
+import '../fixtures/fx_crypto.dart' as fx;
 import 'helpers/crypto_fixtures.dart';
 import 'helpers/fakes.dart';
 
@@ -38,6 +39,14 @@ void main() {
       expect(hexOf(k.iv!), '911eefc8e9ca20cca3a5437f35fee305');
     });
 
+    test('challenge encrypt_type 3: the secret is UPPER_HEX(SHA256(password)) (Windows transform_password)', () {
+      final k = deriveMd5Keys(
+          username: 'admin', nonce: kMd5NonceAdmin, plainPassword: 'cloudpass', encryptType: '3')!;
+      final secret = sha256.convert('cloudpass'.codeUnits).toString().toUpperCase();
+      expect(hexOf(k.aesKey), md5.convert('$kMd5NonceAdmin:$secret'.codeUnits).toString());
+      expect(hexOf(k.iv!), kMd5AdminIvHex);
+    });
+
     test('unknown username yields null', () {
       expect(deriveMd5Keys(username: 'guest', nonce: 'ff00', plainPassword: 'x'), isNull);
     });
@@ -60,6 +69,13 @@ void main() {
       final k = keys();
       expect(hexOf(k.aesKey), kHkdfAesKeyHex);
       expect(hexOf(k.hmacKey!), kHkdfHmacKeyHex);
+    });
+
+    test('challenge without encrypt_type: the secret is UPPER_HEX(MD5(secret)) (Windows transform_password)', () {
+      final k = deriveHkdfKeys(KeyExchange.parse(kHkdfKeyExchange), plainSecret: kHkdfLat, encryptType: null);
+      final want = fx.mediaHkdfKeys(kHkdfNonce, fx.md5Upper(kHkdfLat), kHkdfSalt);
+      expect(hexOf(k.aesKey), hexOf(want.aesKey));
+      expect(hexOf(k.hmacKey!), hexOf(want.hmacKey));
     });
 
     test('ciphertext fixture matches the golden hash', () {

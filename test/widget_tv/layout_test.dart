@@ -9,9 +9,9 @@ import 'package:tapo_tv/ui/tv.dart';
 
 import 'support.dart';
 
-void expectInsideSafeArea(WidgetTester tester, {bool checkBottom = false}) {
+void expectInsideSafeArea(WidgetTester tester, {bool checkBottom = false, bool allowNone = false}) {
   final rects = focusableRects(tester);
-  expect(rects, isNotEmpty, reason: 'screen has no focusable item');
+  if (!allowNone) expect(rects, isNotEmpty, reason: 'screen has no focusable item');
   for (final r in rects) {
     expect(r.left, greaterThanOrEqualTo(safeRect.left), reason: 'left of $r');
     expect(r.right, lessThanOrEqualTo(safeRect.right), reason: 'right of $r');
@@ -75,7 +75,22 @@ void main() {
     testWidgets('recordings timeline screen', (tester) async {
       final app = await pumpApp(tester, cameras: [viewCam('a', 'Home Camera A', caps: {CameraCapability.sdCard})], actions: FakeCameraActions());
       await pushScreen(tester, VodTimelineScreen(camera: app.cameras.first, videoBuilder: fakeVideo));
-      expectInsideSafeArea(tester);
+      // The timeline is driven by ONE screen-level Focus (scrub/day/OK keys,
+      // spec ui.recordings.screen), so it has no TvFocusable rows; check the
+      // interactive surface itself: day label, cursor label and the 24 h bar.
+      final rects = [
+        for (final k in const ['timeline-day-label', 'timeline-cursor-label', 'timeline-bar'])
+          tester.getRect(find.byKey(ValueKey(k))),
+      ];
+      expect(Focus.of(tester.element(find.byKey(const ValueKey('timeline-bar')))).hasFocus, isTrue,
+          reason: 'the screen owns the focus');
+      for (final r in rects) {
+        expect(r.left, greaterThanOrEqualTo(safeRect.left), reason: 'left of $r');
+        expect(r.right, lessThanOrEqualTo(safeRect.right), reason: 'right of $r');
+        expect(r.top, greaterThanOrEqualTo(safeRect.top), reason: 'top of $r');
+        expect(r.bottom, lessThanOrEqualTo(safeRect.bottom), reason: 'bottom of $r');
+      }
+      expectInsideSafeArea(tester, allowNone: true);
     });
   });
 }

@@ -50,18 +50,20 @@ String _upperHex(List<int> bytes) =>
 Uint8List _md5(String s) => Uint8List.fromList(md5.convert(utf8.encode(s)).bytes);
 
 /// Legacy MD5 keys: key = MD5(nonce + ':' + secret), iv = MD5(username + ':'
-/// + nonce), raw 16 bytes. `admin`: secret = UPPER_HEX(MD5(plainPassword));
-/// `none`: the default media password (untransformed); any other username
-/// returns null (parts cannot be read).
+/// + nonce), raw 16 bytes. `admin`: secret = the Digest transform of
+/// plainPassword (UPPER_HEX(SHA256) when the challenge's [encryptType] is `3`,
+/// else UPPER_HEX(MD5)); `none`: the default media password (untransformed);
+/// any other username returns null (parts cannot be read).
+/// Windows: `vod/session.py` `_setup_encryption` + `transform_password`.
 StreamKeys? deriveMd5Keys({
   required String username,
   required String nonce,
   required String plainPassword,
+  String? encryptType,
 }) {
   final String secret;
   if (username == 'admin') {
-    final plain = plainPassword.isEmpty ? kDefaultMediaPassword : plainPassword;
-    secret = _upperHex(md5.convert(utf8.encode(plain)).bytes);
+    secret = _transform(plainPassword, encryptType);
   } else if (username == 'none') {
     secret = kDefaultMediaPassword;
   } else {
@@ -70,18 +72,24 @@ StreamKeys? deriveMd5Keys({
   return StreamKeys(aesKey: _md5('$nonce:$secret'), iv: _md5('$username:$nonce'));
 }
 
+String _transform(String plain, String? encryptType) {
+  final bytes = utf8.encode(plain.isEmpty ? kDefaultMediaPassword : plain);
+  return _upperHex(encryptType?.trim() == '3' ? sha256.convert(bytes).bytes : md5.convert(bytes).bytes);
+}
+
 Uint8List _hkdf16(List<int> ikm, List<int>? salt, String info) {
   final prk = Hmac(sha256, (salt == null || salt.isEmpty) ? List<int>.filled(32, 0) : salt).convert(ikm).bytes;
   final t1 = Hmac(sha256, prk).convert([...utf8.encode(info), 1]).bytes;
   return Uint8List.fromList(t1.sublist(0, 16));
 }
 
-/// HKDF-SHA256 keys, L=16: ikm = nonce + ':' + secret with secret =
-/// UPPER_HEX(SHA256(plainSecret)); salt = the Key-Exchange salt as UTF-8
-/// (none when empty); info `stream_hkdf_aes_key` and `stream_hkdf_hmac_key`.
-StreamKeys deriveHkdfKeys(KeyExchange keyExchange, {required String plainSecret}) {
-  final plain = plainSecret.isEmpty ? kDefaultMediaPassword : plainSecret;
-  final secret = _upperHex(sha256.convert(utf8.encode(plain)).bytes);
+/// HKDF-SHA256 keys, L=16: ikm = nonce + ':' + secret with secret = the
+/// Digest transform of plainSecret ([encryptType] `3`: UPPER_HEX(SHA256), else
+/// UPPER_HEX(MD5); pass the challenge's encrypt_type); salt = the Key-Exchange
+/// salt as UTF-8 (none when empty); info `stream_hkdf_aes_key` and
+/// `stream_hkdf_hmac_key`.
+StreamKeys deriveHkdfKeys(KeyExchange keyExchange, {required String plainSecret, String? encryptType = '3'}) {
+  final secret = keyExchange.username == 'none' ? kDefaultMediaPassword : _transform(plainSecret, encryptType);
   final ikm = utf8.encode('${keyExchange.nonce}:$secret');
   final saltText = keyExchange.salt ?? '';
   final salt = saltText.isEmpty ? null : utf8.encode(saltText);

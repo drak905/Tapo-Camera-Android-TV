@@ -65,13 +65,13 @@ List<fx.TdpDevice> _fleet() => [
         mac: '00-11-22-33-44-02',
         deviceId: _id(2),
         encrypt: false,
-        httpPort: 8443,
       ),
       // TPAP-only firmware hint
       fx.TdpDevice(
         ip: '192.168.1.53',
         mac: '0011.2233.4403',
         deviceId: _id(3),
+        httpPort: 8443,
         extra: const {
           'tpap': {
             'pake': [1],
@@ -148,12 +148,15 @@ void main() {
 
     final m2 = matches[_id(2)]!;
     expect(m2.host, '192.168.1.52');
-    expect(m2.httpsPort, 8443);
+    // The port is only carried inside encrypt_info (Windows discovery/tdp.py:140;
+    // mock_tdp.dart puts http_port only there), so a plain reply means 443.
+    expect(m2.httpsPort, 443);
     expect(m2.byMd5, isTrue);
 
     final m3 = matches[_id(3)]!;
     expect(m3.host, '192.168.1.53');
     expect(m3.controlProtocol, 'tpap');
+    expect(m3.httpsPort, 8443, reason: 'http_port from encrypt_info overrides 443');
   }, timeout: const Timeout(Duration(seconds: 60)));
 
   test('a probe with a corrupted CRC is ignored by the camera', () async {
