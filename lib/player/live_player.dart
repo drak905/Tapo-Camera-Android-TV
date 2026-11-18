@@ -11,6 +11,19 @@ import 'stream_queue.dart';
 
 enum LiveState { connecting, playing, retrying, failed }
 
+/// Message shown when the native player fails: the bridge's last error for
+/// the camera (secrets redacted) when there is one, else the player's own
+/// message, else `Stream interrupted`.
+String mapPlayerError({String? bridgeError, String? playerMessage}) => throw UnimplementedError();
+
+/// Wraps the native view so it never takes D-pad focus: `ExcludeFocus`
+/// (excluding true) around the platform view. Hybrid composition,
+/// transparent hit testing.
+Widget excludeNativeFocus(Widget platformView) => throw UnimplementedError();
+
+/// Creation params of the native view: `url`, `snapshot`.
+Map<String, Object?> nativeVideoParams({required String url, String? snapshotPath}) => throw UnimplementedError();
+
 /// Routes native player events (see LivePlayer.kt) to their view.
 class _PlayerEvents {
   _PlayerEvents._() {

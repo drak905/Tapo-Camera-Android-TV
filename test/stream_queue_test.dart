@@ -41,4 +41,31 @@ void main() {
       a.release();
     });
   });
+
+  test('retry skips queue', () {
+    fakeAsync((async) {
+      final queue = StreamQueue.instance;
+      final started = <String>[];
+      final busy = queue.request(); // occupies the single starting slot
+      final waiting = queue.request();
+      busy.ready.then((_) => started.add('busy'));
+      waiting.ready.then((_) => started.add('waiting'));
+      async.flushMicrotasks();
+      expect(started, ['busy']);
+
+      final retry = queue.request(skipQueue: true); // manual Retry
+      retry.ready.then((_) => started.add('retry'));
+      async.flushMicrotasks();
+      expect(started, ['busy', 'retry'], reason: 'retry starts at once, without waiting for the slot');
+
+      retry.release(); // does not free the slot held by the busy stream
+      async.flushMicrotasks();
+      expect(started, ['busy', 'retry']);
+
+      busy.release();
+      async.flushMicrotasks();
+      expect(started, ['busy', 'retry', 'waiting']);
+      waiting.release();
+    });
+  });
 }
