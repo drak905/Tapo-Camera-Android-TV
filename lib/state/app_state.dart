@@ -9,6 +9,9 @@ import 'package:shared_preferences/shared_preferences.dart';
 import '../api/relay_bridge.dart';
 import '../api/tapo_cloud.dart';
 import '../player/stream_queue.dart';
+import 'camera_actions.dart';
+import 'camera_sort.dart';
+import 'camera_view_model.dart';
 import 'grids.dart';
 
 enum AuthStage { starting, signedOut, mfa, signedIn }
@@ -18,13 +21,25 @@ class Camera {
   final Map<String, dynamic> raw;
 
   String get deviceId => '${raw['deviceId'] ?? ''}';
-  String get name => '${raw['alias'] ?? raw['deviceName'] ?? 'Camera'}'.trim();
+  String get name => view?.displayName ?? '${raw['alias'] ?? raw['deviceName'] ?? 'Camera'}'.trim();
   String get model => '${raw['deviceModel'] ?? ''}';
   String get firmware => '${raw['fwVer'] ?? ''}'.split(' ').first;
 
   /// Account list status; not a live reachability check (the relay can still
   /// work while this reports 0), so it is only used as a hint.
   bool get reportedOnline => raw['status'] == 1;
+
+  /// View model from the api lane (role, online, route, capabilities).
+  CameraViewModel? view;
+  bool get online => view?.online ?? reportedOnline;
+  CameraRoute get route => view?.route ?? CameraRoute.cloud;
+  bool get isShared => view?.isShared ?? ('${raw['role'] ?? 0}' != '0');
+  Set<CameraCapability> get capabilities => view?.capabilities ?? const {};
+  String? get localName => view?.localName;
+
+  /// null = unknown.
+  DayNightMode? dayNight;
+  bool? alarm;
 
   bool? privacy;
   bool? ptz;
@@ -503,5 +518,41 @@ class AppState extends ChangeNotifier {
     notifyListeners();
   }
 
+
+  // ------------------------------------------- ui lane RED stubs (GREEN fills) --
+
+  /// Control interface supplied by the api lane (adapter by the orchestrator).
+  CameraActions? actions;
+
+  CameraSort get cameraSort => throw UnimplementedError('ui lane GREEN: cameraSort');
+  Future<void> setCameraSort(CameraSort sort) => throw UnimplementedError('ui lane GREEN: setCameraSort');
+
+  /// Cameras in the chosen sort order (home list, live prev/next, digit keys).
+  List<Camera> get sortedCameras => throw UnimplementedError('ui lane GREEN: sortedCameras');
+
+  /// 1..8, default 4.
+  int get maxRemoteStreams => throw UnimplementedError('ui lane GREEN: maxRemoteStreams');
+  Future<void> setMaxRemoteStreams(int value) => throw UnimplementedError('ui lane GREEN: setMaxRemoteStreams');
+
+  /// Opt-in, default false.
+  bool get rememberPassword => throw UnimplementedError('ui lane GREEN: rememberPassword');
+  Future<void> setRememberPassword(bool value) => throw UnimplementedError('ui lane GREEN: setRememberPassword');
+
+  /// Optimistic update + rollback + error toast is the UI's job; these throw
+  /// on failure after restoring the previous value.
+  Future<void> setDayNight(Camera camera, DayNightMode mode) => throw UnimplementedError('ui lane GREEN: setDayNight');
+  Future<void> setAlarm(Camera camera, bool on) => throw UnimplementedError('ui lane GREEN: setAlarm');
+
+  /// Owned: renames on the camera; shared/manual: local display name only.
+  Future<void> renameCamera(Camera camera, String name) => throw UnimplementedError('ui lane GREEN: renameCamera');
+  Future<void> resetCameraName(Camera camera) => throw UnimplementedError('ui lane GREEN: resetCameraName');
+
+  /// Per-camera account; at most one login test per save.
+  Future<String?> cameraAccountUser(Camera camera) => throw UnimplementedError('ui lane GREEN: cameraAccountUser');
+  Future<bool> saveCameraAccount(Camera camera, String username, String password) =>
+      throw UnimplementedError('ui lane GREEN: saveCameraAccount');
+
+  /// Drops unknown camera ids and duplicates inside one saved grid.
+  void cleanGridSlots() => throw UnimplementedError('ui lane GREEN: cleanGridSlots');
   String get regionHost => Uri.tryParse(_baseUrl)?.host ?? _baseUrl;
 }

@@ -3,7 +3,7 @@ import 'package:flutter/material.dart';
 import 'theme.dart';
 import 'tv.dart';
 
-enum GuideSection { basics, home, multiview, live }
+enum GuideSection { basics, home, multiview, live, recordings }
 
 enum _RemoteKey { up, down, left, right, ok, back, home, menu, chUp, chDown, digits }
 
@@ -60,6 +60,7 @@ final Map<GuideSection, (String, IconData, List<_Row>)> _sections = {
           'Hold OK on a tile to put another camera in it.', {_RemoteKey.ok}),
     ],
   ),
+  GuideSection.recordings: ('Recordings', Icons.history_rounded, []), // RED stub: rows come with GREEN
   GuideSection.live: (
     'Live view',
     Icons.live_tv_rounded,
