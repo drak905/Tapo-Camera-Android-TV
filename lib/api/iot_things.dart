@@ -4,7 +4,7 @@
 import 'dart:convert';
 
 import 'cloud_transport.dart';
-import 'tapo_cloud.dart' show TapoException, appName, appVersion;
+import 'tapo_cloud.dart' show TapoException, buildIotHeaders;
 
 /// One entry of `GET {iot}/v2/things`.
 class IotThing {
@@ -119,19 +119,7 @@ class IotThingsClient {
     final response = await transport.send(CloudRequest(
       method: 'GET',
       uri: uri,
-      headers: {
-        'Authorization': 'ut|$token',
-        'app-cid': 'app:$appName:$terminalUuid',
-        'x-app-name': appName,
-        'x-app-version': appVersion,
-        'x-term-id': terminalUuid,
-        'x-ospf': 'Android 14',
-        'x-net-type': 'wifi',
-        'x-strict': '0',
-        'x-locale': locale,
-        'User-Agent': '$appName/$appVersion(cloud-only;AndroidTV)',
-        'Accept': 'application/json',
-      },
+      headers: buildIotHeaders(token: token, terminalUuid: terminalUuid, locale: locale),
     ));
     Object? decoded;
     try {

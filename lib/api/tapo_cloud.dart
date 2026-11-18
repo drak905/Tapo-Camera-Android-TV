@@ -141,6 +141,28 @@ bool _isPrintable(String text) {
 
 final _base64Strict = RegExp(r'^[A-Za-z0-9+/]+={0,2}$');
 
+/// IoT cloud headers (never logged: they carry the session token). Not
+/// HMAC-signed. Spec: hc.cloud.iot_headers.
+Map<String, String> buildIotHeaders({
+  required String token,
+  required String terminalUuid,
+  String locale = 'en_US',
+  bool post = false,
+}) =>
+    {
+      'Authorization': 'ut|$token',
+      'app-cid': 'app:$appName:$terminalUuid',
+      'x-app-name': appName,
+      'x-app-version': appVersion,
+      'x-term-id': terminalUuid,
+      'x-ospf': _platformName,
+      'x-net-type': 'wifi',
+      'x-strict': '0',
+      'x-locale': locale,
+      'User-Agent': '$appName/$appVersion(cloud-only;AndroidTV)',
+      'Accept': 'application/json',
+      if (post) 'Content-Type': _jsonType,
+    };
 /// Result of [TapoCloud.login]: either a token or a pending MFA challenge.
 class LoginResult {
   LoginResult(this.baseUrl, this.result);
@@ -416,20 +438,8 @@ class TapoCloud {
 
   /// IoT headers (Authorization `ut|<token>`, app-cid, x-*; no HMAC headers).
   /// Spec: hc.cloud.iot_headers.
-  Map<String, String> iotHeaders({bool post = false}) => {
-        'Authorization': 'ut|$token',
-        'app-cid': 'app:$appName:$terminalUuid',
-        'x-app-name': appName,
-        'x-app-version': appVersion,
-        'x-term-id': terminalUuid,
-        'x-ospf': _platformName,
-        'x-net-type': 'wifi',
-        'x-strict': '0',
-        'x-locale': locale,
-        'User-Agent': '$appName/$appVersion(cloud-only;AndroidTV)',
-        'Accept': 'application/json',
-        if (post) 'Content-Type': _jsonType,
-      };
+  Map<String, String> iotHeaders({bool post = false}) =>
+      buildIotHeaders(token: token, terminalUuid: terminalUuid, locale: locale, post: post);
 
   /// Plain alias or Base64 alias (only when len%4==0, len>=4, strict base64 of
   /// printable UTF-8 that re-encodes identically). Spec: hc.cloud.alias_decode.
