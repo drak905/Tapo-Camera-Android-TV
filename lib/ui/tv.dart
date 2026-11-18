@@ -215,6 +215,7 @@ class TvButton extends StatelessWidget {
     return Semantics(
       button: true,
       enabled: !disabled,
+      excludeSemantics: true,
       label: semanticLabel ?? label,
       child: TvFocusable(
         autofocus: autofocus,
@@ -411,7 +412,9 @@ class TvTile extends StatelessWidget {
     return Semantics(
       button: onSelect != null,
       selected: selected,
+      excludeSemantics: true,
       label: title,
+      hint: subtitle,
       child: TvCard(
         autofocus: autofocus,
         focusNode: focusNode,
@@ -868,6 +871,24 @@ class TvDialog extends StatelessWidget {
 
 Future<T?> showTvDialog<T>(BuildContext context, WidgetBuilder builder) =>
     showDialog<T>(context: context, barrierColor: Colors.black54, builder: builder);
+
+/// A longer menu (several entries, some of them toggles). It is a full-screen
+/// route on a dark backdrop instead of a popup: the page below stops
+/// painting and animating (no preview streams run behind it) and, since only
+/// the menu is on screen, every focusable item belongs to it. Back closes it.
+Future<T?> showTvMenu<T>(BuildContext context, WidgetBuilder builder) =>
+    Navigator.of(context).push<T>(
+      PageRouteBuilder<T>(
+        opaque: true,
+        transitionDuration: TopoMotion.navigation,
+        reverseTransitionDuration: TopoMotion.navigation,
+        pageBuilder: (context, _, _) => Scaffold(
+          backgroundColor: TopoColors.media,
+          body: Center(child: builder(context)),
+        ),
+        transitionsBuilder: (_, animation, _, child) => FadeTransition(opacity: animation, child: child),
+      ),
+    );
 
 /// Confirmation dialog; Cancel is focused and Back cancels.
 Future<bool> confirmDialog(

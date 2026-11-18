@@ -4,14 +4,24 @@ import 'package:flutter/services.dart';
 import 'screens/home_screen.dart';
 import 'screens/login_screen.dart';
 import 'state/app_state.dart';
+import 'state/io_transports.dart';
+import 'state/secure_store.dart';
 import 'ui/guide.dart';
+import 'ui/motion_pip_toast.dart';
 import 'ui/theme.dart';
 import 'ui/tv.dart';
 
 void main() {
   WidgetsFlutterBinding.ensureInitialized();
   SystemChrome.setEnabledSystemUIMode(SystemUiMode.immersiveSticky);
-  final app = AppState()..init();
+  // Session token (and the password only after the opt-in) live in Android
+  // Keystore storage; the demo mode needs neither storage nor network.
+  final backend = FlutterSecureBackend();
+  final app = AppState(
+    secureStore: AppState.demo ? null : SecureStore(backend),
+    secureBackend: AppState.demo ? null : backend,
+    useBackend: !AppState.demo,
+  )..init();
   runApp(TopoTvApp(app: app));
 }
 
@@ -82,7 +92,12 @@ class _TopoTvAppState extends State<TopoTvApp> {
           onKeyEvent: _globalKeys,
           child: child!,
         ),
-        home: const _Root(),
+        home: MotionToastHost(
+          events: widget.app.motionEvents,
+          cameraName: (id) => widget.app.cameraById(id)?.name,
+          notificationsEnabled: () => widget.app.motionNotifications,
+          child: const _Root(),
+        ),
       ),
     );
   }

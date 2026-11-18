@@ -6,11 +6,15 @@ import '../main.dart';
 import '../player/live_player.dart';
 import '../player/stream_queue.dart';
 import '../state/app_state.dart';
+import '../state/camera_actions.dart';
+import '../state/camera_view_model.dart';
 import '../ui/guide.dart';
+import '../ui/route_badge.dart';
 import '../ui/theme.dart';
 import '../ui/tv.dart';
 import 'live_screen.dart';
 import 'multiview_screen.dart';
+import 'rename_dialog.dart';
 import 'settings_screen.dart';
 
 const _digitKeys = [
@@ -48,7 +52,7 @@ int? digitIndex(LogicalKeyboardKey key) {
 /// Opens the full-screen live view for camera [index].
 Future<void> openLive(BuildContext context, int index) async {
   final app = AppScope.read(context);
-  if (index < 0 || index >= app.cameras.length) return;
+  if (index < 0 || index >= app.sortedCameras.length) return;
   final previous = guideSection.value;
   await Navigator.of(context).push(
     PageRouteBuilder<void>(
@@ -224,48 +228,148 @@ class CamerasPanel extends StatefulWidget {
 class _CamerasPanelState extends State<CamerasPanel> {
   final _videoKeys = <String, GlobalKey<LiveVideoState>>{};
 
+  static String _dayNightLabel(DayNightMode? mode) => switch (mode) {
+        DayNightMode.on => 'Night vision on',
+        DayNightMode.off => 'Day mode',
+        _ => 'Auto',
+      };
+
+  static DayNightMode _nextDayNight(DayNightMode? mode) => switch (mode) {
+        DayNightMode.auto || null => DayNightMode.on,
+        DayNightMode.on => DayNightMode.off,
+        DayNightMode.off => DayNightMode.auto,
+      };
+
+  Future<void> _cycleNightVision(BuildContext dialogContext, AppState app, Camera camera) async {
+    try {
+      await app.setDayNight(camera, _nextDayNight(camera.dayNight));
+    } catch (e) {
+      if (dialogContext.mounted) showToast(dialogContext, e.toString(), error: true);
+    }
+  }
+
+  Future<void> _toggleSiren(BuildContext dialogContext, AppState app, Camera camera) async {
+    final on = !(camera.alarm ?? false);
+    try {
+      await app.setAlarm(camera, on);
+      if (dialogContext.mounted) showToast(dialogContext, on ? 'Siren is on' : 'Siren is off');
+    } catch (e) {
+      if (dialogContext.mounted) showToast(dialogContext, e.toString(), error: true);
+    }
+  }
+
+  Future<void> _rename(Camera camera) async {
+    final app = AppScope.read(context);
+    final name = await showRenameDialog(context, currentName: camera.name, localOnly: camera.isShared);
+    if (!mounted || name == null) return;
+    try {
+      await app.renameCamera(camera, name);
+      if (mounted) showToast(context, 'Renamed to $name');
+    } catch (e) {
+      if (mounted) showToast(context, _renameError(e), error: true);
+    }
+  }
+
+  static String _renameError(Object e) {
+    if (e is CameraActionException && e.code == -63103) {
+      return 'The camera refused this name. Use a shorter name with letters, numbers and spaces.';
+    }
+    return e.toString();
+  }
+
   Future<void> _quickActions(Camera camera, int index) async {
     final app = AppScope.read(context);
-    final privacy = camera.privacy;
-    final action = await showTvDialog<String>(
+    final action = await showTvMenu<String>(
       context,
-      (context) => TvDialog(
-        title: camera.name,
-        message: camera.model,
-        children: [
-          TvTile(
-            title: 'Watch live',
-            icon: Icons.play_arrow_rounded,
-            autofocus: true,
-            onSelect: () => Navigator.pop(context, 'live'),
-          ),
-          const SizedBox(height: TopoSpace.md),
-          TvTile(
-            title: privacy == true ? 'Turn privacy mode off' : 'Turn privacy mode on',
-            subtitle: privacy == null
-                ? 'Checking the camera…'
-                : privacy
-                    ? 'Video starts again'
-                    : 'The lens is covered and video stops',
-            icon: privacy == true ? Icons.visibility_rounded : Icons.visibility_off_rounded,
-            onSelect: privacy == null ? null : () => Navigator.pop(context, 'privacy'),
-          ),
-          const SizedBox(height: TopoSpace.md),
-          TvTile(
-            title: 'Reconnect preview',
-            icon: Icons.refresh_rounded,
-            onSelect: () => Navigator.pop(context, 'reconnect'),
-          ),
-        ],
+      (context) => ListenableBuilder(
+        listenable: app,
+        builder: (context, _) {
+          final privacy = camera.privacy;
+          final caps = camera.capabilities;
+          return TvDialog(
+            title: camera.name,
+            message: camera.model,
+            children: [
+              TvTile(
+                title: 'Watch live',
+                icon: Icons.play_arrow_rounded,
+                autofocus: true,
+                onSelect: () => Navigator.pop(context, 'live'),
+              ),
+              const SizedBox(height: TopoSpace.md),
+              TvTile(
+                title: privacy == true ? 'Turn privacy mode off' : 'Turn privacy mode on',
+                subtitle: privacy == null
+                    ? 'Checking the camera…'
+                    : privacy
+                        ? 'Video starts again'
+                        : 'The lens is covered and video stops',
+                icon: privacy == true ? Icons.visibility_rounded : Icons.visibility_off_rounded,
+                onSelect: privacy == null ? null : () => Navigator.pop(context, 'privacy'),
+              ),
+              if (caps.contains(CameraCapability.nightVision)) ...[
+                const SizedBox(height: TopoSpace.md),
+                TvTile(
+                  title: 'Night vision',
+                  subtitle: _dayNightLabel(camera.dayNight),
+                  icon: Icons.nightlight_round,
+                  onSelect: () => _cycleNightVision(context, app, camera),
+                ),
+              ],
+              if (caps.contains(CameraCapability.siren)) ...[
+                const SizedBox(height: TopoSpace.md),
+                TvTile(
+                  title: 'Siren',
+                  subtitle: camera.alarm == true ? 'On' : 'Off',
+                  icon: Icons.notifications_active_rounded,
+                  onSelect: () => _toggleSiren(context, app, camera),
+                ),
+              ],
+              if (camera.view != null) ...[
+                const SizedBox(height: TopoSpace.md),
+                TvTile(
+                  title: 'Rename',
+                  subtitle: camera.isShared ? 'Only on this TV' : 'Saved on the camera',
+                  icon: Icons.edit_rounded,
+                  onSelect: () => Navigator.pop(context, 'rename'),
+                ),
+              ],
+              if (camera.isShared && camera.localName != null) ...[
+                const SizedBox(height: TopoSpace.md),
+                TvTile(
+                  title: 'Reset to camera name',
+                  icon: Icons.restart_alt_rounded,
+                  onSelect: () => Navigator.pop(context, 'reset'),
+                ),
+              ],
+              const SizedBox(height: TopoSpace.md),
+              TvTile(
+                title: 'Reconnect preview',
+                icon: Icons.refresh_rounded,
+                onSelect: () => Navigator.pop(context, 'reconnect'),
+              ),
+            ],
+          );
+        },
       ),
     );
     if (!mounted || action == null) return;
+    final privacy = camera.privacy;
     switch (action) {
       case 'live':
         await openLive(context, index);
       case 'reconnect':
         _videoKeys[camera.deviceId]?.currentState?.restart();
         await app.refreshCameraState(camera, force: true);
+      case 'rename':
+        await _rename(camera);
+      case 'reset':
+        try {
+          await app.resetCameraName(camera);
+          if (mounted) showToast(context, 'Showing the camera name again');
+        } catch (e) {
+          if (mounted) showToast(context, e.toString(), error: true);
+        }
       case 'privacy':
         final enable = !(privacy ?? false);
         showToast(context, enable ? 'Turning privacy mode on…' : 'Turning privacy mode off…', icon: Icons.hourglass_top_rounded);
@@ -289,7 +393,7 @@ class _CamerasPanelState extends State<CamerasPanel> {
   @override
   Widget build(BuildContext context) {
     final app = AppScope.of(context);
-    final cameras = app.cameras;
+    final cameras = app.sortedCameras;
     final showVideo = app.livePreviews && widget.active;
     if (cameras.isEmpty) return _Empty(app: app);
     return Focus(
@@ -475,6 +579,15 @@ class _CameraCardState extends State<_CameraCard> {
                       SnapshotView(
                         deviceId: camera.deviceId,
                         fallback: const _Placeholder(icon: Icons.videocam_rounded, text: 'Press OK to watch'),
+                      ),
+                    if (camera.view != null)
+                      Positioned(
+                        right: TopoSpace.sm,
+                        top: TopoSpace.sm,
+                        child: RouteBadge(
+                          route: camera.isShared ? CameraRoute.cloud : camera.route,
+                          online: camera.online,
+                        ),
                       ),
                     Positioned(
                       left: TopoSpace.sm,

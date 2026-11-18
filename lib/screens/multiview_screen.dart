@@ -7,8 +7,10 @@ import '../main.dart';
 import '../player/live_player.dart';
 import '../player/stream_queue.dart';
 import '../state/app_state.dart';
+import '../state/camera_view_model.dart' show CameraRoute;
 import '../state/grids.dart';
 import '../ui/guide.dart';
+import '../ui/route_badge.dart';
 import '../ui/theme.dart';
 import '../ui/tv.dart';
 import 'home_screen.dart' show cameraStatus, digitIndex, openLive;
@@ -58,7 +60,7 @@ Future<String?> pickCamera(BuildContext context, {required int slot, String? cur
           autofocus: current == null,
           onSelect: () => Navigator.pop(context, ''),
         ),
-        for (final camera in app.cameras) ...[
+        for (final camera in app.sortedCameras) ...[
           const SizedBox(height: TopoSpace.md),
           TvTile(
             title: camera.name,
@@ -512,9 +514,26 @@ class _GridViewScreenState extends State<GridViewScreen> {
     return KeyEventResult.handled;
   }
 
+  /// Inside the grid bar the arrows stay in the bar (it overlaps the top
+  /// tiles): Left/Right walk its items, Up stays, Down returns to the tiles.
   KeyEventResult _barKey(FocusNode node, KeyEvent event) {
-    if (event is! KeyDownEvent || event.logicalKey != LogicalKeyboardKey.arrowDown) return KeyEventResult.ignored;
-    _focusTiles();
+    if (event is! KeyDownEvent && event is! KeyRepeatEvent) return KeyEventResult.ignored;
+    final key = event.logicalKey;
+    if (key == LogicalKeyboardKey.arrowDown) {
+      if (event is KeyDownEvent) _focusTiles();
+      return KeyEventResult.handled;
+    }
+    if (key == LogicalKeyboardKey.arrowUp) return KeyEventResult.handled;
+    if (key != LogicalKeyboardKey.arrowLeft && key != LogicalKeyboardKey.arrowRight) return KeyEventResult.ignored;
+    final items = [
+      for (final n in node.traversalDescendants)
+        if (n.canRequestFocus && n.context?.mounted == true) n,
+    ]..sort((a, b) => a.rect.left.compareTo(b.rect.left));
+    final current = FocusManager.instance.primaryFocus;
+    final i = current == null ? -1 : items.indexOf(current);
+    if (i < 0) return KeyEventResult.ignored;
+    final next = key == LogicalKeyboardKey.arrowRight ? i + 1 : i - 1;
+    if (next >= 0 && next < items.length) items[next].requestFocus();
     return KeyEventResult.handled;
   }
 
@@ -545,28 +564,25 @@ class _GridViewScreenState extends State<GridViewScreen> {
                   canRequestFocus: false,
                   skipTraversal: true,
                   onKeyEvent: _tilesKey,
-                  // While the grid bar has focus, arrows must stay inside it
-                  // (the bar overlaps the top tiles); Down returns explicitly.
-                  child: ExcludeFocus(
-                    excluding: _barFocused,
-                    child: FocusTraversalGroup(
-                      child: TileLayout(
-                        layout: grid.layout,
-                        gap: 14,
-                        builder: (i) {
-                          final camera = app.cameraById(grid.slots[i]);
-                          return _GridTile(
-                            key: ValueKey('${grid.id}-$i-${camera?.deviceId}'),
-                            app: app,
-                            camera: camera,
-                            number: i + 1,
-                            focusNode: i == 0 ? _firstTile : null,
-                            active: app.foreground && TickerMode.valuesOf(context).enabled,
-                            onSelect: () => _openTile(grid, i),
-                            onLongSelect: () => _changeTile(grid, i),
-                          );
-                        },
-                      ),
+                  // While the grid bar has focus its own key handler keeps the
+                  // arrows inside it (the bar overlaps the top tiles).
+                  child: FocusTraversalGroup(
+                    child: TileLayout(
+                      layout: grid.layout,
+                      gap: 14,
+                      builder: (i) {
+                        final camera = app.cameraById(grid.slots[i]);
+                        return _GridTile(
+                          key: ValueKey('${grid.id}-$i-${camera?.deviceId}'),
+                          app: app,
+                          camera: camera,
+                          number: i + 1,
+                          focusNode: i == 0 ? _firstTile : null,
+                          active: app.foreground && TickerMode.valuesOf(context).enabled,
+                          onSelect: () => _openTile(grid, i),
+                          onLongSelect: () => _changeTile(grid, i),
+                        );
+                      },
                     ),
                   ),
                 ),
@@ -742,6 +758,16 @@ class _GridTileState extends State<_GridTile> {
                     compact: true,
                     onStateChanged: (s) => setState(() => _live = s),
                   ),
+                if (camera != null && camera.view != null)
+                  Positioned(
+                    right: TopoSpace.sm,
+                    top: TopoSpace.sm,
+                    child: RouteBadge(
+                      route: camera.isShared ? CameraRoute.cloud : camera.route,
+                      online: camera.online,
+                      compact: true,
+                    ),
+                  ),
                 // Name label on an opaque media backing for legibility.
                 Positioned(
                   left: TopoSpace.sm,
@@ -832,7 +858,7 @@ class _GridEditorScreenState extends State<GridEditorScreen> {
 
   void _fillAll() {
     final app = AppScope.read(context);
-    setState(() => _slots = _fit([for (final c in app.cameras) c.deviceId], _layout));
+    setState(() => _slots = _fit([for (final c in app.sortedCameras) c.deviceId], _layout));
   }
 
   Future<void> _save() async {
@@ -982,24 +1008,28 @@ class _GridEditorScreenState extends State<GridEditorScreen> {
                                   if (picked == null) return;
                                   setState(() => _slots = [...slots]..[i] = picked.isEmpty ? null : picked);
                                 },
-                                child: (focused) => Column(
-                                  mainAxisAlignment: MainAxisAlignment.center,
-                                  children: [
-                                    Icon(
-                                      camera == null ? Icons.add_circle_outline_rounded : Icons.videocam_rounded,
-                                      color: TopoColors.primaryAction,
-                                      size: _layout.slots > 6 ? 22 : 30,
-                                    ),
-                                    const SizedBox(height: 4),
-                                    Text(
-                                      camera?.name ?? 'Tile ${i + 1}',
-                                      maxLines: 1,
-                                      overflow: TextOverflow.ellipsis,
-                                      style: TopoText.label.copyWith(fontSize: _layout.slots > 6 ? 15 : 18),
-                                    ),
-                                    if (camera == null && _layout.slots <= 6)
-                                      const Text('Add camera', style: TopoText.caption),
-                                  ],
+                                child: (focused) => LayoutBuilder(
+                                  builder: (context, box) {
+                                    final small = box.maxHeight < 110;
+                                    return Column(
+                                      mainAxisAlignment: MainAxisAlignment.center,
+                                      children: [
+                                        Icon(
+                                          camera == null ? Icons.add_circle_outline_rounded : Icons.videocam_rounded,
+                                          color: TopoColors.primaryAction,
+                                          size: small ? 22 : 30,
+                                        ),
+                                        const SizedBox(height: 4),
+                                        Text(
+                                          camera?.name ?? 'Tile ${i + 1}',
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TopoText.label.copyWith(fontSize: small ? 15 : 18),
+                                        ),
+                                        if (camera == null && !small) const Text('Add camera', style: TopoText.caption),
+                                      ],
+                                    );
+                                  },
                                 ),
                               );
                             },
