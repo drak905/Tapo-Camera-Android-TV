@@ -6,6 +6,7 @@ import 'dart:convert';
 import 'dart:math';
 import 'dart:typed_data';
 
+import '../media/media_deps.dart';
 import 'camera_dtos.dart';
 import 'camera_transport.dart';
 import 'local_crypto.dart';
@@ -29,6 +30,26 @@ class LocalSecrets {
 
   @override
   String toString() => 'LocalSecrets(<hidden>)';
+}
+
+/// :8800 media credentials from the camera's local secrets: the LAT when one
+/// is known, else the cloud password (Windows vod/session.py `_secret`,
+/// [spec:lat.media.digest]). User `admin`.
+class LocalSecretsMediaAuth implements LocalMediaAuth {
+  const LocalSecretsMediaAuth(this.secrets);
+  final LocalSecrets secrets;
+
+  @override
+  String get digestSecret {
+    final lat = secrets.lat;
+    return (lat != null && lat.isNotEmpty) ? lat : secrets.password;
+  }
+
+  @override
+  String get username => 'admin';
+
+  @override
+  String toString() => 'LocalSecretsMediaAuth(<hidden>)';
 }
 
 /// TDP hint for the first login step.
@@ -199,6 +220,10 @@ class CameraControlClient {
 
   /// True when a cloud-issued local access token was given.
   bool get usesLocalToken => _lat.isNotEmpty;
+
+  /// Credentials for this camera's :8800 media port (same secrets as the
+  /// control login: LAT first, then the cloud password).
+  LocalMediaAuth get mediaAuth => LocalSecretsMediaAuth(_secrets);
 
   // ------------------------------------------------------------------ login
 

@@ -360,6 +360,11 @@ class TapoCloud {
   }
 
   /// Silent re-login with the stored credentials [spec hc.cloud.token_refresh].
+  /// Public entry for callers outside the account API (relay -1102 / HTTP 401):
+  /// one full login with the remembered account; throws `TapoException`
+  /// -20651 when no credentials are remembered.
+  Future<void> relogin() => _relogin(captcha: false);
+
   Future<void> _relogin({required bool captcha}) async {
     final email = _email, password = _password, region = _region;
     if (email == null || password == null || region == null) {
