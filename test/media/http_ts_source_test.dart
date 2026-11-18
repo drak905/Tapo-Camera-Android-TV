@@ -1,7 +1,6 @@
 // Demo mode: the TS demo stream reaches ExoPlayer through the RelayBridge
 // (the native player only accepts bridge URLs, PlayerPolicy.isBridgeUrl).
 
-import 'dart:async';
 import 'dart:io';
 import 'dart:typed_data';
 
